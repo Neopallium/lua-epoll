@@ -31,7 +31,11 @@ local function poll_loop()
 		assert(epoller:wait(events, -1))
 		for i=1,#events,2 do
 			local fd = events[i]
-			local ev = events[i]
+			local ev = events[i+1]
+			-- remove event from table.
+			events[i] = nil
+			events[i+1] = nil
+			-- call registered callback.
 			local sock = socks[fd]
 			local cb = cbs[fd]
 			if sock and cb then
@@ -40,16 +44,6 @@ local function poll_loop()
 		end
 	end
 end
-
---[[
-local function new_connection(host, port, family, stype)
-	local sock = nixio.connect(host, port, family or 'any', stype or 'stream')
-	local fd = sock:fileno()
-	socks[fd] = sock
-	sock:setblocking(false)
-	return sock
-end
-]]
 
 local function accept_connection(sock, cb)
 	local client = sock:accept()
@@ -84,7 +78,6 @@ end
 
 local function new_client(server)
 	accept_connection(server, function(sock, events)
-		print(sock, events)
 		local msg = sock:recv(1024)
 		if msg and #msg > 0 then
 			sock:send("echo:" .. msg)
@@ -95,17 +88,20 @@ local function new_client(server)
 	end)
 end
 
-local function new_server(host_port)
-	local host, port = host_port:match("([*.0-9]*):([0-9]*)")
-	print("listen on:", host, port)
-	new_acceptor(host, port, 'inet', function(sock, events)
-		print("accept new client on:", host, port)
+local function new_server(port)
+	print("listen on:", port)
+	new_acceptor('*', port, 'inet', function(sock, events)
+		print("accept new client on:", port)
 		new_client(sock)
 	end)
 end
 
 for i=1,#arg do
 	new_server(arg[i])
+end
+
+if #arg == 0 then
+	new_server("1080")
 end
 
 poll_loop()

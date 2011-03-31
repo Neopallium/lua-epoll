@@ -20,16 +20,18 @@
 
 local epoll_types = [[
 typedef union epoll_data {
-    void        *ptr;
-    int          fd;
-    uint32_t     u32;
-    uint64_t     u64;
+	void        *ptr;
+	int          fd;
+	uint32_t     u32;
+	uint64_t     u64;
 } epoll_data_t;
 
-typedef struct epoll_event {
-    uint32_t     events;      /* Epoll events */
-    epoll_data_t data;        /* User data variable */
-} epoll_event;
+struct epoll_event {
+	uint32_t     events;      /* Epoll events */
+	epoll_data_t data;        /* User data variable */
+} __attribute__ ((__packed__));
+
+typedef struct epoll_event epoll_event;
 ]]
 
 local Epoller_type = [[
@@ -136,6 +138,9 @@ static int epoller_wait(Epoller *this, int timeout) {
 		c_source[[
 	${rc} = epoller_add(${this}, ${fd}, ${events}, ${id});
 ]],
+		ffi_source[[
+	${rc} = epoller_add(${this}, ${fd}, ${events}, ${id});
+]],
   },
   method "mod" {
 		var_in{ "int", "fd" },
@@ -145,11 +150,17 @@ static int epoller_wait(Epoller *this, int timeout) {
 		c_source[[
 	${rc} = epoller_mod(${this}, ${fd}, ${events}, ${id});
 ]],
+		ffi_source[[
+	${rc} = epoller_mod(${this}, ${fd}, ${events}, ${id});
+]],
   },
   method "del" {
 		var_in{ "int", "fd" },
 		var_out{ "int", "rc" },
 		c_source[[
+	${rc} = epoller_del(${this}, ${fd});
+]],
+		ffi_source[[
 	${rc} = epoller_del(${this}, ${fd});
 ]],
   },
@@ -172,5 +183,18 @@ static int epoller_wait(Epoller *this, int timeout) {
 		}
 	}
 ]],
-  },
+ 		ffi_source[[
+	${rc} = epoller_wait(${this}, ${timeout});
+	if (${rc} > 0) then
+		local idx = 1
+		-- fill 'events' table with event <id, events> pairs.
+		for n=0,(${rc}-1) do
+			${events}[idx] = tonumber(${this}.events[n].data.u64)
+			idx = idx + 1
+			${events}[idx] = tonumber(${this}.events[n].events)
+			idx = idx + 1
+		end
+	end
+]],
+ },
 }

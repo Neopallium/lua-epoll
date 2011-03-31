@@ -831,16 +831,18 @@ static const char epoll_ffi_lua_code[] = "-- try loading luajit's ffi\n"
 "\n"
 "ffi.cdef[[\n"
 "typedef union epoll_data {\n"
-"    void        *ptr;\n"
-"    int          fd;\n"
-"    uint32_t     u32;\n"
-"    uint64_t     u64;\n"
+"	void        *ptr;\n"
+"	int          fd;\n"
+"	uint32_t     u32;\n"
+"	uint64_t     u64;\n"
 "} epoll_data_t;\n"
 "\n"
-"typedef struct epoll_event {\n"
-"    uint32_t     events;      /* Epoll events */\n"
-"    epoll_data_t data;        /* User data variable */\n"
-"} epoll_event;\n"
+"struct epoll_event {\n"
+"	uint32_t     events;      /* Epoll events */\n"
+"	epoll_data_t data;        /* User data variable */\n"
+"} __attribute__ ((__packed__));\n"
+"\n"
+"typedef struct epoll_event epoll_event;\n"
 "\n"
 "typedef struct Epoller {\n"
 "	int epfd;\n"
@@ -904,6 +906,64 @@ static const char epoll_ffi_lua_code[] = "-- try loading luajit's ffi\n"
 "local epoller_del = ffi.new(\"epoller_del_func\", _priv[\"epoller_del\"])\n"
 "\n"
 "local epoller_wait = ffi.new(\"epoller_wait_func\", _priv[\"epoller_wait\"])\n"
+"\n"
+"-- method: add\n"
+"function Epoller_meth.add(self, fd, events, id)\n"
+"  local this = obj_type_Epoller_check(self)\n"
+"  \n"
+"  \n"
+"  \n"
+"  local rc\n"
+"	rc = epoller_add(this, fd, events, id);\n"
+"\n"
+"  rc = rc\n"
+"  return rc\n"
+"end\n"
+"\n"
+"-- method: mod\n"
+"function Epoller_meth.mod(self, fd, events, id)\n"
+"  local this = obj_type_Epoller_check(self)\n"
+"  \n"
+"  \n"
+"  \n"
+"  local rc\n"
+"	rc = epoller_mod(this, fd, events, id);\n"
+"\n"
+"  rc = rc\n"
+"  return rc\n"
+"end\n"
+"\n"
+"-- method: del\n"
+"function Epoller_meth.del(self, fd)\n"
+"  local this = obj_type_Epoller_check(self)\n"
+"  \n"
+"  local rc\n"
+"	rc = epoller_del(this, fd);\n"
+"\n"
+"  rc = rc\n"
+"  return rc\n"
+"end\n"
+"\n"
+"-- method: wait\n"
+"function Epoller_meth.wait(self, events, timeout)\n"
+"  local this = obj_type_Epoller_check(self)\n"
+"  \n"
+"  local rc\n"
+"	rc = epoller_wait(this, timeout);\n"
+"	if (rc > 0) then\n"
+"		local idx = 1\n"
+"		-- fill 'events' table with event <id, events> pairs.\n"
+"		for n=0,(rc-1) do\n"
+"			events[idx] = tonumber(this.events[n].data.u64)\n"
+"			idx = idx + 1\n"
+"			events[idx] = tonumber(this.events[n].events)\n"
+"			idx = idx + 1\n"
+"		end\n"
+"	end\n"
+"\n"
+"  rc = rc\n"
+"  return rc\n"
+"end\n"
 "\n"
 "-- End \"Epoller\" FFI interface\n"
 "\n"
@@ -982,93 +1042,93 @@ static int epoller_wait(Epoller *this, int timeout) {
 
 /* method: new */
 static int Epoller__new__meth(lua_State *L) {
-  int size_idx1 = luaL_optinteger(L,1,64);
-  int this_flags_idx1 = OBJ_UDATA_FLAG_OWN;
-  Epoller * this_idx1;
-	this_idx1 = epoller_create(size_idx1);
+  int size = luaL_optinteger(L,1,64);
+  int this_flags = OBJ_UDATA_FLAG_OWN;
+  Epoller * this;
+	this = epoller_create(size);
 
-  obj_type_Epoller_push(L, this_idx1, this_flags_idx1);
+  obj_type_Epoller_push(L, this, this_flags);
   return 1;
 }
 
 /* method: delete */
 static int Epoller__delete__meth(lua_State *L) {
-  int this_flags_idx1 = 0;
-  Epoller * this_idx1 = obj_type_Epoller_delete(L,1,&(this_flags_idx1));
-  if(!(this_flags_idx1 & OBJ_UDATA_FLAG_OWN)) { return 0; }
-	epoller_destroy(this_idx1);
+  int this_flags = 0;
+  Epoller * this = obj_type_Epoller_delete(L,1,&(this_flags));
+  if(!(this_flags & OBJ_UDATA_FLAG_OWN)) { return 0; }
+	epoller_destroy(this);
 
   return 0;
 }
 
 /* method: add */
 static int Epoller__add__meth(lua_State *L) {
-  Epoller * this_idx1 = obj_type_Epoller_check(L,1);
-  int fd_idx2 = luaL_checkinteger(L,2);
-  uint32_t events_idx3 = luaL_checkinteger(L,3);
-  uint64_t id_idx4 = luaL_checkinteger(L,4);
-  int rc_idx1 = 0;
-	rc_idx1 = epoller_add(this_idx1, fd_idx2, events_idx3, id_idx4);
+  Epoller * this = obj_type_Epoller_check(L,1);
+  int fd = luaL_checkinteger(L,2);
+  uint32_t events = luaL_checkinteger(L,3);
+  uint64_t id = luaL_checkinteger(L,4);
+  int rc = 0;
+	rc = epoller_add(this, fd, events, id);
 
-  lua_pushinteger(L, rc_idx1);
+  lua_pushinteger(L, rc);
   return 1;
 }
 
 /* method: mod */
 static int Epoller__mod__meth(lua_State *L) {
-  Epoller * this_idx1 = obj_type_Epoller_check(L,1);
-  int fd_idx2 = luaL_checkinteger(L,2);
-  uint32_t events_idx3 = luaL_checkinteger(L,3);
-  uint64_t id_idx4 = luaL_checkinteger(L,4);
-  int rc_idx1 = 0;
-	rc_idx1 = epoller_mod(this_idx1, fd_idx2, events_idx3, id_idx4);
+  Epoller * this = obj_type_Epoller_check(L,1);
+  int fd = luaL_checkinteger(L,2);
+  uint32_t events = luaL_checkinteger(L,3);
+  uint64_t id = luaL_checkinteger(L,4);
+  int rc = 0;
+	rc = epoller_mod(this, fd, events, id);
 
-  lua_pushinteger(L, rc_idx1);
+  lua_pushinteger(L, rc);
   return 1;
 }
 
 /* method: del */
 static int Epoller__del__meth(lua_State *L) {
-  Epoller * this_idx1 = obj_type_Epoller_check(L,1);
-  int fd_idx2 = luaL_checkinteger(L,2);
-  int rc_idx1 = 0;
-	rc_idx1 = epoller_del(this_idx1, fd_idx2);
+  Epoller * this = obj_type_Epoller_check(L,1);
+  int fd = luaL_checkinteger(L,2);
+  int rc = 0;
+	rc = epoller_del(this, fd);
 
-  lua_pushinteger(L, rc_idx1);
+  lua_pushinteger(L, rc);
   return 1;
 }
 
 /* method: wait */
 static int Epoller__wait__meth(lua_State *L) {
-  Epoller * this_idx1 = obj_type_Epoller_check(L,1);
-  int timeout_idx3 = luaL_checkinteger(L,3);
-  int rc_idx1 = 0;
+  Epoller * this = obj_type_Epoller_check(L,1);
+  int timeout = luaL_checkinteger(L,3);
+  int rc = 0;
 	luaL_checktype(L, 2, LUA_TTABLE);
-	rc_idx1 = epoller_wait(this_idx1, timeout_idx3);
-	if(rc_idx1 > 0) {
+	rc = epoller_wait(this, timeout);
+	if(rc > 0) {
 		int idx;
 		int n;
 		/* fill 'events' table with event <id, events> pairs. */
-		for(n = 0, idx = 1; n < rc_idx1; n++) {
-			lua_pushinteger(L, this_idx1->events[n].data.u64);
+		for(n = 0, idx = 1; n < rc; n++) {
+			lua_pushinteger(L, this->events[n].data.u64);
 			lua_rawseti(L, 2, idx); idx++;
-			lua_pushinteger(L, this_idx1->events[n].events);
+			lua_pushinteger(L, this->events[n].events);
 			lua_rawseti(L, 2, idx); idx++;
 		}
 	}
 
-  lua_pushinteger(L, rc_idx1);
+  lua_pushinteger(L, rc);
   return 1;
 }
 
 /* method: new */
 static int epoll__new__func(lua_State *L) {
-  int size_idx1 = luaL_optinteger(L,1,64);
-  int this_flags_idx1 = OBJ_UDATA_FLAG_OWN;
-  Epoller * this_idx1;
-	this_idx1 = epoller_create(size_idx1);
+  int size = luaL_optinteger(L,1,64);
+  int this_flags = OBJ_UDATA_FLAG_OWN;
+  Epoller * this;
+	this = epoller_create(size);
 
-  obj_type_Epoller_push(L, this_idx1, this_flags_idx1);
+  obj_type_Epoller_push(L, this, this_flags);
   return 1;
 }
 
