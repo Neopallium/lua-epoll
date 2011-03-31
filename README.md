@@ -1,16 +1,14 @@
 lua-epoll
 =======
 
-LibEpoll bindings for Lua.
+Lightweight epoll wrapper.
 
 Installing
 ----------
 
 ### Install lua-epoll:
 
-	curl -O "__project_github_url__/raw/master/lua-epoll-scm-0.rockspec"
-	
-	luarocks install lua-epoll-scm-0.rockspec
+	luarocks install https://github.com/Neopallium/lua-epoll/raw/master/lua-epoll-scm-0.rockspec
 
 
 To re-generating the bindings
