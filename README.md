@@ -3,6 +3,8 @@ lua-epoll
 
 Lightweight epoll wrapper.
 
+See the `examples/nixio_server.lua` for an example of how to use.
+
 Installing
 ----------
 
