@@ -10,10 +10,6 @@
 #include "lauxlib.h"
 #include "lualib.h"
 
-#include <sys/epoll.h>
-#include <string.h>
-
-
 #define REG_PACKAGE_IS_CONSTRUCTOR 0
 #define REG_OBJECTS_AS_GLOBALS 0
 #define OBJ_DATA_HIDDEN_METATABLE 1
@@ -21,23 +17,71 @@
 #define USE_FIELD_GET_SET_METHODS 0
 
 
+#include <sys/epoll.h>
+#include <string.h>
+
+
 
 #include <stdlib.h>
 #include <string.h>
 #include <assert.h>
+#include <errno.h>
 
 #ifdef _MSC_VER
+#define __WINDOWS__
+#else
+#if defined(_WIN32)
+#define __WINDOWS__
+#endif
+#endif
+
+#ifdef __WINDOWS__
+
+/* for MinGW32 compiler need to include <stdint.h> */
+#ifdef __GNUC__
+#include <stdint.h>
+#else
 
 /* define some standard types missing on Windows. */
+#ifndef __INT32_MAX__
 typedef __int32 int32_t;
-typedef __int64 int64_t;
 typedef unsigned __int32 uint32_t;
+#endif
+#ifndef __INT64_MAX__
+typedef __int64 int64_t;
 typedef unsigned __int64 uint64_t;
+#endif
 typedef int bool;
+#ifndef true
+#define true 1
+#endif
+#ifndef false
+#define false 1
+#endif
+
+#endif
+
+/* wrap strerror_s(). */
+#ifdef __GNUC__
+#ifndef strerror_r
+#define strerror_r(errno, buf, buflen) do { \
+	strncpy((buf), strerror(errno), (buflen)-1); \
+	(buf)[(buflen)-1] = '\0'; \
+} while(0)
+#endif
+#else
+#ifndef strerror_r
+#define strerror_r(errno, buf, buflen) strerror_s((buf), (buflen), (errno))
+#endif
+#endif
 
 #define FUNC_UNUSED
 
+#define LUA_NOBJ_API __declspec(dllexport)
+
 #else
+
+#define LUA_NOBJ_API LUALIB_API
 
 #include <stdint.h>
 #include <stdbool.h>
@@ -123,15 +167,22 @@ typedef struct obj_field {
 	uint32_t        flags;  /**< is_writable:1bit */
 } obj_field;
 
+typedef enum {
+	REG_OBJECT,
+	REG_PACKAGE,
+	REG_META,
+} module_reg_type;
+
 typedef struct reg_sub_module {
 	obj_type        *type;
-	int             is_package;
+	module_reg_type req_type;
 	const luaL_reg  *pub_funcs;
 	const luaL_reg  *methods;
 	const luaL_reg  *metas;
 	const obj_base  *bases;
 	const obj_field *fields;
 	const obj_const *constants;
+	bool            bidirectional_consts;
 } reg_sub_module;
 
 #define OBJ_UDATA_FLAG_OWN (1<<0)
@@ -153,19 +204,14 @@ typedef struct ffi_export_symbol {
 #endif
 
 
+
+
+static obj_type obj_types[] = {
 #define obj_type_id_Epoller 0
-#define obj_type_Epoller_check(L, _index) \
-	obj_udata_luacheck(L, _index, &(obj_type_Epoller))
-#define obj_type_Epoller_delete(L, _index, flags) \
-	obj_udata_luadelete_weak(L, _index, &(obj_type_Epoller), flags)
-#define obj_type_Epoller_push(L, obj, flags) \
-	obj_udata_luapush_weak(L, (void *)obj, &(obj_type_Epoller), flags)
-
-
-
-
-
-static obj_type obj_type_Epoller = { NULL, 0, OBJ_TYPE_FLAG_WEAK_REF, "Epoller" };
+#define obj_type_Epoller (obj_types[obj_type_id_Epoller])
+  { NULL, 0, OBJ_TYPE_FLAG_WEAK_REF, "Epoller" },
+  {NULL, -1, 0, NULL},
+};
 
 
 #ifndef REG_PACKAGE_IS_CONSTRUCTOR
@@ -235,7 +281,7 @@ static FUNC_UNUSED int obj_udata_is_compatible(lua_State *L, obj_udata *ud, void
 	return 0;
 }
 
-static FUNC_UNUSED obj_udata *obj_udata_luacheck_internal(lua_State *L, int _index, void **obj, obj_type *type) {
+static FUNC_UNUSED obj_udata *obj_udata_luacheck_internal(lua_State *L, int _index, void **obj, obj_type *type, int not_delete) {
 	obj_udata *ud;
 	base_caster_t caster = NULL;
 	/* make sure it's a userdata value. */
@@ -251,32 +297,44 @@ static FUNC_UNUSED obj_udata *obj_udata_luacheck_internal(lua_State *L, int _ind
 				}
 				/* check object pointer. */
 				if(*obj == NULL) {
-					luaL_error(L, "null %s", type->name); /* object was garbage collected? */
+					if(not_delete) {
+						luaL_error(L, "null %s", type->name); /* object was garbage collected? */
+					}
+					return NULL;
 				}
 				return ud;
 			}
 		}
 	}
-	luaL_typerror(L, _index, type->name); /* is not a userdata value. */
+	if(not_delete) {
+		luaL_typerror(L, _index, type->name); /* is not a userdata value. */
+	}
 	return NULL;
 }
 
 static FUNC_UNUSED void *obj_udata_luacheck(lua_State *L, int _index, obj_type *type) {
 	void *obj = NULL;
-	obj_udata_luacheck_internal(L, _index, &(obj), type);
+	obj_udata_luacheck_internal(L, _index, &(obj), type, 1);
+	return obj;
+}
+
+static FUNC_UNUSED void *obj_udata_luaoptional(lua_State *L, int _index, obj_type *type) {
+	void *obj = NULL;
+	if(lua_isnil(L, _index)) {
+		return obj;
+	}
+	obj_udata_luacheck_internal(L, _index, &(obj), type, 1);
 	return obj;
 }
 
 static FUNC_UNUSED void *obj_udata_luadelete(lua_State *L, int _index, obj_type *type, int *flags) {
 	void *obj;
-	obj_udata *ud = obj_udata_luacheck_internal(L, _index, &(obj), type);
+	obj_udata *ud = obj_udata_luacheck_internal(L, _index, &(obj), type, 0);
+	if(ud == NULL) return NULL;
 	*flags = ud->flags;
 	/* null userdata. */
 	ud->obj = NULL;
 	ud->flags = 0;
-	/* clear the metatable to invalidate userdata. */
-	lua_pushnil(L);
-	lua_setmetatable(L, _index);
 	return obj;
 }
 
@@ -303,14 +361,12 @@ static FUNC_UNUSED void obj_udata_luapush(lua_State *L, void *obj, obj_type *typ
 
 static FUNC_UNUSED void *obj_udata_luadelete_weak(lua_State *L, int _index, obj_type *type, int *flags) {
 	void *obj;
-	obj_udata *ud = obj_udata_luacheck_internal(L, _index, &(obj), type);
+	obj_udata *ud = obj_udata_luacheck_internal(L, _index, &(obj), type, 0);
+	if(ud == NULL) return NULL;
 	*flags = ud->flags;
 	/* null userdata. */
 	ud->obj = NULL;
 	ud->flags = 0;
-	/* clear the metatable to invalidate userdata. */
-	lua_pushnil(L);
-	lua_setmetatable(L, _index);
 	/* get objects weak table. */
 	lua_pushlightuserdata(L, obj_udata_weak_ref_key);
 	lua_rawget(L, LUA_REGISTRYINDEX); /* weak ref table. */
@@ -422,6 +478,13 @@ static FUNC_UNUSED void * obj_simple_udata_luacheck(lua_State *L, int _index, ob
 	return NULL;
 }
 
+static FUNC_UNUSED void * obj_simple_udata_luaoptional(lua_State *L, int _index, obj_type *type) {
+	if(lua_isnil(L, _index)) {
+		return NULL;
+	}
+	return obj_simple_udata_luacheck(L, _index, type);
+}
+
 static FUNC_UNUSED void * obj_simple_udata_luadelete(lua_State *L, int _index, obj_type *type, int *flags) {
 	void *obj;
 	obj = obj_simple_udata_luacheck(L, _index, type);
@@ -432,7 +495,7 @@ static FUNC_UNUSED void * obj_simple_udata_luadelete(lua_State *L, int _index, o
 	return obj;
 }
 
-static FUNC_UNUSED void obj_simple_udata_luapush(lua_State *L, void *obj, int size, obj_type *type)
+static FUNC_UNUSED void *obj_simple_udata_luapush(lua_State *L, void *obj, int size, obj_type *type)
 {
 	/* create new userdata. */
 	void *ud = lua_newuserdata(L, size);
@@ -441,6 +504,8 @@ static FUNC_UNUSED void obj_simple_udata_luapush(lua_State *L, void *obj, int si
 	lua_pushlightuserdata(L, type);
 	lua_rawget(L, LUA_REGISTRYINDEX); /* type's metatable. */
 	lua_setmetatable(L, -2);
+
+	return ud;
 }
 
 /* default simple object equal method. */
@@ -486,7 +551,8 @@ static int obj_constructor_call_wrapper(lua_State *L) {
 	return lua_gettop(L);
 }
 
-static void obj_type_register_constants(lua_State *L, const obj_const *constants, int tab_idx) {
+static void obj_type_register_constants(lua_State *L, const obj_const *constants, int tab_idx,
+		bool bidirectional) {
 	/* register constants. */
 	while(constants->name != NULL) {
 		lua_pushstring(L, constants->name);
@@ -504,6 +570,22 @@ static void obj_type_register_constants(lua_State *L, const obj_const *constants
 			lua_pushnil(L);
 			break;
 		}
+		/* map values back to keys. */
+		if(bidirectional) {
+			/* check if value already exists. */
+			lua_pushvalue(L, -1);
+			lua_rawget(L, tab_idx - 3);
+			if(lua_isnil(L, -1)) {
+				lua_pop(L, 1);
+				/* add value->key mapping. */
+				lua_pushvalue(L, -1);
+				lua_pushvalue(L, -3);
+				lua_rawset(L, tab_idx - 4);
+			} else {
+				/* value already exists. */
+				lua_pop(L, 1);
+			}
+		}
 		lua_rawset(L, tab_idx - 2);
 		constants++;
 	}
@@ -518,9 +600,33 @@ static void obj_type_register_package(lua_State *L, const reg_sub_module *type_r
 		luaL_register(L, NULL, reg_list);
 	}
 
-	obj_type_register_constants(L, type_reg->constants, -1);
+	obj_type_register_constants(L, type_reg->constants, -1, type_reg->bidirectional_consts);
 
 	lua_pop(L, 1);  /* drop package table */
+}
+
+static void obj_type_register_meta(lua_State *L, const reg_sub_module *type_reg) {
+	const luaL_reg *reg_list;
+
+	/* create public functions table. */
+	reg_list = type_reg->pub_funcs;
+	if(reg_list != NULL && reg_list[0].name != NULL) {
+		/* register functions */
+		luaL_register(L, NULL, reg_list);
+	}
+
+	obj_type_register_constants(L, type_reg->constants, -1, type_reg->bidirectional_consts);
+
+	/* register methods. */
+	luaL_register(L, NULL, type_reg->methods);
+
+	/* create metatable table. */
+	lua_newtable(L);
+	luaL_register(L, NULL, type_reg->metas); /* fill metatable */
+	/* setmetatable on meta-object. */
+	lua_setmetatable(L, -2);
+
+	lua_pop(L, 1);  /* drop meta-object */
 }
 
 static void obj_type_register(lua_State *L, const reg_sub_module *type_reg, int priv_table) {
@@ -528,8 +634,12 @@ static void obj_type_register(lua_State *L, const reg_sub_module *type_reg, int 
 	obj_type *type = type_reg->type;
 	const obj_base *base = type_reg->bases;
 
-	if(type_reg->is_package == 1) {
+	if(type_reg->req_type == REG_PACKAGE) {
 		obj_type_register_package(L, type_reg);
+		return;
+	}
+	if(type_reg->req_type == REG_META) {
+		obj_type_register_meta(L, type_reg);
 		return;
 	}
 
@@ -545,6 +655,14 @@ static void obj_type_register(lua_State *L, const reg_sub_module *type_reg, int 
 		lua_pushcfunction(L, reg_list[0].func); /* push first constructor function. */
 		lua_pushcclosure(L, obj_constructor_call_wrapper, 1); /* make __call wrapper. */
 		lua_rawset(L, -3);         /* metatable.__call = <default constructor> */
+
+#if OBJ_DATA_HIDDEN_METATABLE
+		lua_pushliteral(L, "__metatable");
+		lua_pushboolean(L, 0);
+		lua_rawset(L, -3);         /* metatable.__metatable = false */
+#endif
+
+		/* setmetatable on public API table. */
 		lua_setmetatable(L, -2);
 
 		lua_pop(L, 1); /* pop public API table, don't need it any more. */
@@ -552,6 +670,11 @@ static void obj_type_register(lua_State *L, const reg_sub_module *type_reg, int 
 		lua_newtable(L);
 	} else {
 		/* register all methods as public functions. */
+#if OBJ_DATA_HIDDEN_METATABLE
+		lua_pop(L, 1); /* pop public API table, don't need it any more. */
+		/* create methods table. */
+		lua_newtable(L);
+#endif
 	}
 
 	luaL_register(L, NULL, type_reg->methods); /* fill methods table. */
@@ -572,6 +695,8 @@ static void obj_type_register(lua_State *L, const reg_sub_module *type_reg, int 
 	lua_pushstring(L, type->name);
 	lua_pushvalue(L, -2); /* dup metatable. */
 	lua_rawset(L, priv_table);    /* priv_table["<object_name>"] = metatable */
+#else
+	(void)priv_table;
 #endif
 
 	luaL_register(L, NULL, type_reg->metas); /* fill metatable */
@@ -583,16 +708,16 @@ static void obj_type_register(lua_State *L, const reg_sub_module *type_reg, int 
 		base++;
 	}
 
-	obj_type_register_constants(L, type_reg->constants, -2);
+	obj_type_register_constants(L, type_reg->constants, -2, type_reg->bidirectional_consts);
 
 	lua_pushliteral(L, "__index");
 	lua_pushvalue(L, -3);               /* dup methods table */
 	lua_rawset(L, -3);                  /* metatable.__index = methods */
 #if OBJ_DATA_HIDDEN_METATABLE
 	lua_pushliteral(L, "__metatable");
-	lua_pushvalue(L, -3);               /* dup methods table */
+	lua_pushboolean(L, 0);
 	lua_rawset(L, -3);                  /* hide metatable:
-	                                       metatable.__metatable = methods */
+	                                       metatable.__metatable = false */
 #endif
 	lua_pop(L, 2);                      /* drop metatable & methods */
 }
@@ -606,11 +731,10 @@ static FUNC_UNUSED int lua_checktype_ref(lua_State *L, int _index, int _type) {
 #if LUAJIT_FFI
 static int nobj_udata_new_ffi(lua_State *L) {
 	size_t size = luaL_checkinteger(L, 1);
-	void *ud;
 	luaL_checktype(L, 2, LUA_TTABLE);
 	lua_settop(L, 2);
 	/* create userdata. */
-	ud = lua_newuserdata(L, size);
+	lua_newuserdata(L, size);
 	lua_replace(L, 1);
 	/* set userdata's metatable. */
 	lua_setmetatable(L, 1);
@@ -650,15 +774,27 @@ static int nobj_try_loading_ffi(lua_State *L, const char *ffi_mod_name,
 #endif
 
 
+#define obj_type_Epoller_check(L, _index) \
+	obj_udata_luacheck(L, _index, &(obj_type_Epoller))
+#define obj_type_Epoller_optional(L, _index) \
+	obj_udata_luaoptional(L, _index, &(obj_type_Epoller))
+#define obj_type_Epoller_delete(L, _index, flags) \
+	obj_udata_luadelete_weak(L, _index, &(obj_type_Epoller), flags)
+#define obj_type_Epoller_push(L, obj, flags) \
+	obj_udata_luapush_weak(L, (void *)obj, &(obj_type_Epoller), flags)
 
-static const char epoll_ffi_lua_code[] = "-- try loading luajit's ffi\n"
+
+
+
+static const char epoll_ffi_lua_code[] = "local error = error\n"
+"local type = type\n"
+"local tonumber = tonumber\n"
+"local tostring = tostring\n"
+"local rawset = rawset\n"
+"\n"
+"-- try loading luajit's ffi\n"
 "local stat, ffi=pcall(require,\"ffi\")\n"
 "if not stat then\n"
-"	return\n"
-"end\n"
-"-- check if ffi is disabled.\n"
-"if disable_ffi then\n"
-"	print(\"FFI disabled: Using standard Lua api interface.\")\n"
 "	return\n"
 "end\n"
 "\n"
@@ -675,7 +811,18 @@ static const char epoll_ffi_lua_code[] = "-- try loading luajit's ffi\n"
 "local OBJ_TYPE_FLAG_WEAK_REF	= 1\n"
 "local OBJ_TYPE_SIMPLE					= 2\n"
 "\n"
-"ffi.cdef[[\n"
+"local function ffi_safe_cdef(block_name, cdefs)\n"
+"	local fake_type = \"struct sentinel_\" .. block_name .. \"_ty\"\n"
+"	local stat, size = pcall(ffi.sizeof, fake_type)\n"
+"	if stat and size > 0 then\n"
+"		-- already loaded this cdef block\n"
+"		return\n"
+"	end\n"
+"	cdefs = fake_type .. \"{ int a; int b; int c; };\" .. cdefs\n"
+"	return ffi.cdef(cdefs)\n"
+"end\n"
+"\n"
+"ffi_safe_cdef(\"LuaNativeObjects\", [[\n"
 "\n"
 "typedef struct obj_type obj_type;\n"
 "\n"
@@ -700,32 +847,38 @@ static const char epoll_ffi_lua_code[] = "-- try loading luajit's ffi\n"
 "	uint32_t flags;  /**< lua_own:1bit */\n"
 "} obj_udata;\n"
 "\n"
-"]]\n"
-"\n"
-"local obj_type_ptr = ffi.typeof\"obj_type *\"\n"
-"local obj_udata_ptr = ffi.typeof\"obj_udata *\"\n"
-"local obj_simple_udata_ptr = ffi.typeof\"void *\"\n"
-"local obj_udata_size = ffi.sizeof\"obj_udata\"\n"
+"]])\n"
 "\n"
 "-- cache mapping of cdata to userdata\n"
 "local weak_objects = setmetatable({}, { __mode = \"v\" })\n"
 "\n"
-"local function obj_udata_luacheck_internal(obj, type_mt)\n"
+"local function obj_udata_luacheck_internal(obj, type_mt, not_delete)\n"
 "	local obj_mt = d_getmetatable(obj)\n"
 "	if obj_mt == type_mt then\n"
 "		-- convert userdata to cdata.\n"
-"		return obj_udata_ptr(obj)\n"
+"		return ffi.cast(\"obj_udata *\", obj)\n"
 "	end\n"
-"	error(\"(expected `\" .. type_mt['.name'] .. \"`, got \" .. type(obj) .. \")\", 3)\n"
+"	if not_delete then\n"
+"		error(\"(expected `\" .. type_mt['.name'] .. \"`, got \" .. type(obj) .. \")\", 3)\n"
+"	end\n"
 "end\n"
 "\n"
 "local function obj_udata_luacheck(obj, type_mt)\n"
-"	local ud = obj_udata_luacheck_internal(obj, type_mt)\n"
+"	local ud = obj_udata_luacheck_internal(obj, type_mt, true)\n"
 "	return ud.obj\n"
 "end\n"
 "\n"
+"local function obj_udata_to_cdata(objects, ud_obj, c_type, ud_mt)\n"
+"	-- convert userdata to cdata.\n"
+"	local c_obj = ffi.cast(c_type, obj_udata_luacheck(ud_obj, ud_mt))\n"
+"	-- cache converted cdata\n"
+"	rawset(objects, ud_obj, c_obj)\n"
+"	return c_obj\n"
+"end\n"
+"\n"
 "local function obj_udata_luadelete(ud_obj, type_mt)\n"
-"	local ud = obj_udata_luacheck_internal(ud_obj, type_mt)\n"
+"	local ud = obj_udata_luacheck_internal(ud_obj, type_mt, false)\n"
+"	if not ud then return nil, 0 end\n"
 "	local obj, flags = ud.obj, ud.flags\n"
 "	-- null userdata.\n"
 "	ud.obj = nil\n"
@@ -748,8 +901,8 @@ static const char epoll_ffi_lua_code[] = "-- try loading luajit's ffi\n"
 "	end\n"
 "\n"
 "	-- create new userdata\n"
-"	ud_obj = udata_new(obj_udata_size, type_mt)\n"
-"	local ud = obj_udata_ptr(ud_obj)\n"
+"	local ud_obj = udata_new(ffi.sizeof\"obj_udata\", type_mt)\n"
+"	local ud = ffi.cast(\"obj_udata *\", ud_obj)\n"
 "	-- init. object\n"
 "	ud.obj = obj\n"
 "	ud.flags = flags\n"
@@ -758,7 +911,8 @@ static const char epoll_ffi_lua_code[] = "-- try loading luajit's ffi\n"
 "end\n"
 "\n"
 "local function obj_udata_luadelete_weak(ud_obj, type_mt)\n"
-"	local ud = obj_udata_luacheck_internal(ud_obj, type_mt)\n"
+"	local ud = obj_udata_luacheck_internal(ud_obj, type_mt, false)\n"
+"	if not ud then return nil, 0 end\n"
 "	local obj, flags = ud.obj, ud.flags\n"
 "	-- null userdata.\n"
 "	ud.obj = nil\n"
@@ -789,8 +943,8 @@ static const char epoll_ffi_lua_code[] = "-- try loading luajit's ffi\n"
 "	if ud_obj ~= nil then return ud_obj end\n"
 "\n"
 "	-- create new userdata\n"
-"	ud_obj = udata_new(obj_udata_size, type_mt)\n"
-"	local ud = obj_udata_ptr(ud_obj)\n"
+"	ud_obj = udata_new(ffi.sizeof\"obj_udata\", type_mt)\n"
+"	local ud = ffi.cast(\"obj_udata *\", ud_obj)\n"
 "	-- init. object\n"
 "	ud.obj = obj\n"
 "	ud.flags = flags\n"
@@ -805,29 +959,49 @@ static const char epoll_ffi_lua_code[] = "-- try loading luajit's ffi\n"
 "	local obj_mt = d_getmetatable(ud_obj)\n"
 "	if obj_mt == type_mt then\n"
 "		-- convert userdata to cdata.\n"
-"		return obj_simple_udata_ptr(ud_obj)\n"
+"		return ffi.cast(\"void *\", ud_obj)\n"
 "	end\n"
 "	error(\"(expected `\" .. type_mt['.name'] .. \"`, got \" .. type(ud_obj) .. \")\", 3)\n"
 "end\n"
 "\n"
+"local function obj_simple_udata_to_cdata(objects, ud_obj, c_type, ud_mt)\n"
+"	-- convert userdata to cdata.\n"
+"	local c_obj = ffi.cast(c_type, obj_simple_udata_luacheck(ud_obj, ud_mt))[0]\n"
+"	-- cache converted cdata\n"
+"	rawset(objects, ud_obj, c_obj)\n"
+"	return c_obj\n"
+"end\n"
+"\n"
+"local function obj_embed_udata_to_cdata(objects, ud_obj, c_type, ud_mt)\n"
+"	-- convert userdata to cdata.\n"
+"	local c_obj = ffi.cast(c_type, obj_simple_udata_luacheck(ud_obj, ud_mt))\n"
+"	-- cache converted cdata\n"
+"	rawset(objects, ud_obj, c_obj)\n"
+"	return c_obj\n"
+"end\n"
+"\n"
 "local function obj_simple_udata_luadelete(ud_obj, type_mt)\n"
-"	local c_obj = obj_simple_udata_luacheck(ud_obj, type_mt)\n"
 "	-- invalid userdata, by setting the metatable to nil.\n"
 "	d_setmetatable(ud_obj, nil)\n"
-"	return c_obj, OBJ_UDATA_FLAG_OWN\n"
+"	return OBJ_UDATA_FLAG_OWN\n"
 "end\n"
 "\n"
 "local function obj_simple_udata_luapush(c_obj, size, type_mt)\n"
 "	if c_obj == nil then return end\n"
 "\n"
 "	-- create new userdata\n"
-"	ud_obj = udata_new(size, type_mt)\n"
-"	local cdata = obj_simple_udata_ptr(ud_obj)\n"
+"	local ud_obj = udata_new(size, type_mt)\n"
+"	local cdata = ffi.cast(\"void *\", ud_obj)\n"
 "	-- init. object\n"
 "	ffi.copy(cdata, c_obj, size)\n"
 "\n"
 "	return ud_obj, cdata\n"
 "end\n"
+"\n"
+"ffi.cdef[[\n"
+"typedef struct Epoller Epoller;\n"
+"\n"
+"]]\n"
 "\n"
 "ffi.cdef[[\n"
 "typedef union epoll_data {\n"
@@ -862,43 +1036,48 @@ static const char epoll_ffi_lua_code[] = "-- try loading luajit's ffi\n"
 "\n"
 "]]\n"
 "\n"
-"local Epoller_pub = _M[\"Epoller\"]\n"
-"local Epoller_mt = _priv[\"Epoller\"]\n"
-"local Epoller_type = obj_type_ptr(Epoller_mt[\".type\"])\n"
-"local Epoller_meth = Epoller_mt.__index\n"
-"local Epoller_objects = setmetatable({}, { __mode = \"k\" })\n"
-"\n"
-"local function obj_type_Epoller_check(ud_obj)\n"
-"	local c_obj = Epoller_objects[ud_obj]\n"
-"	if c_obj == nil then\n"
-"		-- cdata object not in cache\n"
-"		c_obj = obj_udata_luacheck(ud_obj, Epoller_mt)\n"
-"		c_obj = ffi.cast(\"Epoller *\", c_obj) -- cast from 'void *'\n"
-"		Epoller_objects[ud_obj] = c_obj\n"
+"local _pub = {}\n"
+"local _meth = {}\n"
+"for obj_name,mt in pairs(_priv) do\n"
+"	if type(mt) == 'table' and mt.__index then\n"
+"		_meth[obj_name] = mt.__index\n"
 "	end\n"
-"	return c_obj\n"
+"end\n"
+"_pub.epoll = _M\n"
+"for obj_name,pub in pairs(_M) do\n"
+"	_pub[obj_name] = pub\n"
 "end\n"
 "\n"
-"local function obj_type_Epoller_delete(ud_obj)\n"
+"\n"
+"local obj_type_Epoller_check\n"
+"local obj_type_Epoller_delete\n"
+"local obj_type_Epoller_push\n"
+"\n"
+"do\n"
+"local Epoller_mt = _priv.Epoller\n"
+"local Epoller_objects = setmetatable({}, { __mode = \"k\",\n"
+"__index = function(objects, ud_obj)\n"
+"	return obj_udata_to_cdata(objects, ud_obj, \"Epoller *\", Epoller_mt)\n"
+"end,\n"
+"})\n"
+"function obj_type_Epoller_check(ud_obj)\n"
+"	return Epoller_objects[ud_obj]\n"
+"end\n"
+"\n"
+"function obj_type_Epoller_delete(ud_obj)\n"
 "	Epoller_objects[ud_obj] = nil\n"
 "	return obj_udata_luadelete_weak(ud_obj, Epoller_mt)\n"
 "end\n"
 "\n"
-"local function obj_type_Epoller_push(c_obj, flags)\n"
+"local Epoller_type = ffi.cast(\"obj_type *\", Epoller_mt[\".type\"])\n"
+"function obj_type_Epoller_push(c_obj, flags)\n"
 "	local ud_obj = obj_udata_luapush_weak(c_obj, Epoller_mt, Epoller_type, flags)\n"
 "	Epoller_objects[ud_obj] = c_obj\n"
 "	return ud_obj\n"
 "end\n"
+"end\n"
 "\n"
 "\n"
-"local epoll_mt = _M\n"
-"local epoll_meth = _M\n"
-"local epoll_func = _M\n"
-"local epoll_pub = _M\n"
-"\n"
-"\n"
-"\n"
-"-- Start \"Epoller\" FFI interface\n"
 "local epoller_add = ffi.new(\"epoller_add_func\", _priv[\"epoller_add\"])\n"
 "\n"
 "local epoller_mod = ffi.new(\"epoller_mod_func\", _priv[\"epoller_mod\"])\n"
@@ -907,8 +1086,10 @@ static const char epoll_ffi_lua_code[] = "-- try loading luajit's ffi\n"
 "\n"
 "local epoller_wait = ffi.new(\"epoller_wait_func\", _priv[\"epoller_wait\"])\n"
 "\n"
+"\n"
+"-- Start \"Epoller\" FFI interface\n"
 "-- method: add\n"
-"function Epoller_meth.add(self, fd, events, id)\n"
+"function _meth.Epoller.add(self, fd, events, id)\n"
 "  local this = obj_type_Epoller_check(self)\n"
 "  \n"
 "  \n"
@@ -921,7 +1102,7 @@ static const char epoll_ffi_lua_code[] = "-- try loading luajit's ffi\n"
 "end\n"
 "\n"
 "-- method: mod\n"
-"function Epoller_meth.mod(self, fd, events, id)\n"
+"function _meth.Epoller.mod(self, fd, events, id)\n"
 "  local this = obj_type_Epoller_check(self)\n"
 "  \n"
 "  \n"
@@ -934,7 +1115,7 @@ static const char epoll_ffi_lua_code[] = "-- try loading luajit's ffi\n"
 "end\n"
 "\n"
 "-- method: del\n"
-"function Epoller_meth.del(self, fd)\n"
+"function _meth.Epoller.del(self, fd)\n"
 "  local this = obj_type_Epoller_check(self)\n"
 "  \n"
 "  local rc\n"
@@ -945,7 +1126,7 @@ static const char epoll_ffi_lua_code[] = "-- try loading luajit's ffi\n"
 "end\n"
 "\n"
 "-- method: wait\n"
-"function Epoller_meth.wait(self, events, timeout)\n"
+"function _meth.Epoller.wait(self, events, timeout)\n"
 "  local this = obj_type_Epoller_check(self)\n"
 "  \n"
 "  local rc\n"
@@ -958,6 +1139,23 @@ static const char epoll_ffi_lua_code[] = "-- try loading luajit's ffi\n"
 "			idx = idx + 1\n"
 "			events[idx] = tonumber(this.events[n].events)\n"
 "			idx = idx + 1\n"
+"		end\n"
+"	end\n"
+"\n"
+"  rc = rc\n"
+"  return rc\n"
+"end\n"
+"\n"
+"-- method: wait_callback\n"
+"function _meth.Epoller.wait_callback(self, event_cb, timeout)\n"
+"  local this = obj_type_Epoller_check(self)\n"
+"  \n"
+"  local rc\n"
+"	rc = epoller_wait(this, timeout);\n"
+"	if (rc > 0) then\n"
+"		-- call 'event_cb' for each <id, events> pair.\n"
+"		for n=0,(rc-1) do\n"
+"			event_cb(tonumber(this.events[n].data.u64), tonumber(this.events[n].events))\n"
 "		end\n"
 "	end\n"
 "\n"
@@ -1121,6 +1319,28 @@ static int Epoller__wait__meth(lua_State *L) {
   return 1;
 }
 
+/* method: wait_callback */
+static int Epoller__wait_callback__meth(lua_State *L) {
+  Epoller * this = obj_type_Epoller_check(L,1);
+  int timeout = luaL_checkinteger(L,3);
+  int rc = 0;
+	luaL_checktype(L, 2, LUA_TFUNCTION);
+	rc = epoller_wait(this, timeout);
+	if(rc > 0) {
+		int n;
+		/* call 'event_cb' for each <id, events> pair. */
+		for(n = 0; n < rc; n++) {
+			lua_pushvalue(L,  2);
+			lua_pushinteger(L, this->events[n].data.u64);
+			lua_pushinteger(L, this->events[n].events);
+			lua_call(L, 2, 0);
+		}
+	}
+
+  lua_pushinteger(L, rc);
+  return 1;
+}
+
 /* method: new */
 static int epoll__new__func(lua_State *L) {
   int size = luaL_optinteger(L,1,64);
@@ -1144,6 +1364,7 @@ static const luaL_reg obj_Epoller_methods[] = {
   {"mod", Epoller__mod__meth},
   {"del", Epoller__del__meth},
   {"wait", Epoller__wait__meth},
+  {"wait_callback", Epoller__wait_callback__meth},
   {NULL, NULL}
 };
 
@@ -1207,8 +1428,8 @@ static const ffi_export_symbol epoll_ffi_export[] = {
 
 
 static const reg_sub_module reg_sub_modules[] = {
-  { &(obj_type_Epoller), 0, obj_Epoller_pub_funcs, obj_Epoller_methods, obj_Epoller_metas, obj_Epoller_bases, obj_Epoller_fields, obj_Epoller_constants},
-  {NULL, 0, NULL, NULL, NULL, NULL, NULL, NULL}
+  { &(obj_type_Epoller), REG_OBJECT, obj_Epoller_pub_funcs, obj_Epoller_methods, obj_Epoller_metas, obj_Epoller_bases, obj_Epoller_fields, obj_Epoller_constants, false},
+  {NULL, 0, NULL, NULL, NULL, NULL, NULL, NULL, false}
 };
 
 
@@ -1242,7 +1463,7 @@ static void create_object_instance_cache(lua_State *L) {
 	lua_rawset(L, LUA_REGISTRYINDEX);  /* create reference to weak table. */
 }
 
-LUALIB_API int luaopen_epoll(lua_State *L) {
+LUA_NOBJ_API int luaopen_epoll(lua_State *L) {
 	const reg_sub_module *reg = reg_sub_modules;
 	const luaL_Reg *submodules = submodule_libs;
 	int priv_table = -1;
@@ -1260,7 +1481,7 @@ LUALIB_API int luaopen_epoll(lua_State *L) {
 	luaL_register(L, "epoll", epoll_function);
 
 	/* register module constants. */
-	obj_type_register_constants(L, epoll_constants, -1);
+	obj_type_register_constants(L, epoll_constants, -1, false);
 
 	for(; submodules->func != NULL ; submodules++) {
 		lua_pushcfunction(L, submodules->func);
@@ -1279,6 +1500,8 @@ LUALIB_API int luaopen_epoll(lua_State *L) {
 #endif
 		obj_type_register(L, reg, priv_table);
 	}
+
+
 
 #if LUAJIT_FFI
 	nobj_try_loading_ffi(L, "epoll", epoll_ffi_lua_code,

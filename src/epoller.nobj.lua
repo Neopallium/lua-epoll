@@ -197,4 +197,32 @@ static int epoller_wait(Epoller *this, int timeout) {
 	end
 ]],
  },
+  method "wait_callback" {
+		var_in{ "<any>", "event_cb" },
+		var_in{ "int", "timeout" },
+		var_out{ "int", "rc" },
+		c_source[[
+	luaL_checktype(L, ${event_cb::idx}, LUA_TFUNCTION);
+	${rc} = epoller_wait(${this}, ${timeout});
+	if(${rc} > 0) {
+		int n;
+		/* call 'event_cb' for each <id, events> pair. */
+		for(n = 0; n < ${rc}; n++) {
+			lua_pushvalue(L,  ${event_cb::idx});
+			lua_pushinteger(L, ${this}->events[n].data.u64);
+			lua_pushinteger(L, ${this}->events[n].events);
+			lua_call(L, 2, 0);
+		}
+	}
+]],
+ 		ffi_source[[
+	${rc} = epoller_wait(${this}, ${timeout});
+	if (${rc} > 0) then
+		-- call 'event_cb' for each <id, events> pair.
+		for n=0,(${rc}-1) do
+			${event_cb}(tonumber(${this}.events[n].data.u64), tonumber(${this}.events[n].events))
+		end
+	end
+]],
+ },
 }
