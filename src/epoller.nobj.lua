@@ -41,6 +41,8 @@ typedef struct Epoller {
 	int count;
 	struct epoll_event *events;
 } Epoller;
+
+int epoller_wait(Epoller *this, int timeout);
 ]]
 
 object "Epoller" {
@@ -60,7 +62,7 @@ static void epoller_grow(Epoller *this) {
 	epoller_resize(this, this->count + 50);
 }
 
-static Epoller *epoller_create(int size) {
+Epoller *epoller_create(int size) {
 	Epoller *this;
 
 	this = (Epoller *)calloc(1, sizeof(Epoller));
@@ -77,7 +79,7 @@ static Epoller *epoller_create(int size) {
 	return this;
 }
 
-static void epoller_destroy(Epoller *this) {
+void epoller_destroy(Epoller *this) {
 	close(this->epfd);
 	free(this->events);
 	free(this);
@@ -90,22 +92,22 @@ static int epoller_ctl(Epoller *this, int op, int fd, uint32_t events, uint64_t 
 	return epoll_ctl(this->epfd, op, fd, &event);
 }
 
-static int epoller_add(Epoller *this, int fd, uint32_t events, uint64_t id) {
+int epoller_add(Epoller *this, int fd, uint32_t events, uint64_t id) {
 	this->count++;
 	epoller_grow(this);
 	return epoller_ctl(this, EPOLL_CTL_ADD, fd, events, id);
 }
 
-static int epoller_mod(Epoller *this, int fd, uint32_t events, uint64_t id) {
+int epoller_mod(Epoller *this, int fd, uint32_t events, uint64_t id) {
 	return epoller_ctl(this, EPOLL_CTL_MOD, fd, events, id);
 }
 
-static int epoller_del(Epoller *this, int fd) {
+int epoller_del(Epoller *this, int fd) {
 	this->count--;
 	return epoller_ctl(this, EPOLL_CTL_DEL, fd, 0, 0);
 }
 
-static int epoller_wait(Epoller *this, int timeout) {
+int epoller_wait(Epoller *this, int timeout) {
 	return epoll_wait(this->epfd, this->events, this->size, timeout);
 }
 
@@ -113,64 +115,31 @@ static int epoller_wait(Epoller *this, int timeout) {
 	-- register epoll & Epoller datastures with FFI.
 	ffi_cdef(epoll_types),
 	ffi_cdef(Epoller_type),
-	-- export epoller C interface to FFI code.
-	ffi_export_function "int" "epoller_add" "(Epoller *this, int fd, uint32_t events, uint64_t id)",
-	ffi_export_function "int" "epoller_mod" "(Epoller *this, int fd, uint32_t events, uint64_t id)",
-	ffi_export_function "int" "epoller_del" "(Epoller *this, int fd)",
-	ffi_export_function "int" "epoller_wait" "(Epoller *this, int timeout)",
+
   constructor {
 		var_in{ "int", "size", is_optional = true, default = 64 },
-		c_source[[
-	${this} = epoller_create(${size});
-]],
+		c_call "Epoller *" "epoller_create" { "int", "size"},
   },
   destructor {
-		c_source[[
-	epoller_destroy(${this});
-]],
+		c_method_call "void" "epoller_destroy" {},
   },
 
   method "add" {
-		var_in{ "int", "fd" },
-		var_in{ "uint32_t", "events" },
-		var_in{ "uint64_t", "id" },
-		var_out{ "int", "rc" },
-		c_source[[
-	${rc} = epoller_add(${this}, ${fd}, ${events}, ${id});
-]],
-		ffi_source[[
-	${rc} = epoller_add(${this}, ${fd}, ${events}, ${id});
-]],
+		c_method_call "errno_rc" "epoller_add" { "int", "fd", "uint32_t", "events", "uint64_t", "id" },
   },
   method "mod" {
-		var_in{ "int", "fd" },
-		var_in{ "uint32_t", "events" },
-		var_in{ "uint64_t", "id" },
-		var_out{ "int", "rc" },
-		c_source[[
-	${rc} = epoller_mod(${this}, ${fd}, ${events}, ${id});
-]],
-		ffi_source[[
-	${rc} = epoller_mod(${this}, ${fd}, ${events}, ${id});
-]],
+		c_method_call "errno_rc" "epoller_mod" { "int", "fd", "uint32_t", "events", "uint64_t", "id" },
   },
   method "del" {
-		var_in{ "int", "fd" },
-		var_out{ "int", "rc" },
-		c_source[[
-	${rc} = epoller_del(${this}, ${fd});
-]],
-		ffi_source[[
-	${rc} = epoller_del(${this}, ${fd});
-]],
+		c_method_call "errno_rc" "epoller_del" { "int", "fd" },
   },
   method "wait" {
 		var_in{ "<any>", "events" },
-		var_in{ "int", "timeout" },
-		var_out{ "int", "rc" },
-		c_source[[
+		c_source "pre_src" [[
 	luaL_checktype(L, ${events::idx}, LUA_TTABLE);
-	${rc} = epoller_wait(${this}, ${timeout});
+]],
+		c_method_call { "errno_rc", "rc" } "epoller_wait" { "int", "timeout" },
+		c_source[[
 	if(${rc} > 0) {
 		int idx;
 		int n;
@@ -184,7 +153,6 @@ static int epoller_wait(Epoller *this, int timeout) {
 	}
 ]],
  		ffi_source[[
-	${rc} = epoller_wait(${this}, ${timeout});
 	if (${rc} > 0) then
 		local idx = 1
 		-- fill 'events' table with event <id, events> pairs.
@@ -199,11 +167,11 @@ static int epoller_wait(Epoller *this, int timeout) {
  },
   method "wait_callback" {
 		var_in{ "<any>", "event_cb" },
-		var_in{ "int", "timeout" },
-		var_out{ "int", "rc" },
-		c_source[[
+		c_source "pre_src" [[
 	luaL_checktype(L, ${event_cb::idx}, LUA_TFUNCTION);
-	${rc} = epoller_wait(${this}, ${timeout});
+]],
+		c_method_call { "errno_rc", "rc" } "epoller_wait" { "int", "timeout" },
+		c_source[[
 	if(${rc} > 0) {
 		int n;
 		/* call 'event_cb' for each <id, events> pair. */
@@ -216,7 +184,6 @@ static int epoller_wait(Epoller *this, int timeout) {
 	}
 ]],
  		ffi_source[[
-	${rc} = epoller_wait(${this}, ${timeout});
 	if (${rc} > 0) then
 		-- call 'event_cb' for each <id, events> pair.
 		for n=0,(${rc}-1) do

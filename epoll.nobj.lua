@@ -6,6 +6,7 @@ c_module "epoll" {
 
 -- enable FFI bindings support.
 luajit_ffi = true,
+luajit_ffi_load_cmodule = true,
 
 sys_include "sys/epoll.h",
 
@@ -20,15 +21,13 @@ export_definitions {
 },
 
 subfiles {
+"src/error.nobj.lua",
 "src/epoller.nobj.lua",
 },
 
 c_function "new" {
 	var_in{ "int", "size", is_optional = true, default = 64 },
-	var_out{ "!Epoller *", "this" },
-	c_source[[
-	${this} = epoller_create(${size});
-]],
+	c_export_call { "Epoller *", "!this" } "epoller_create" { "int", "size"},
 },
 }
 

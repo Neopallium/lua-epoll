@@ -13,8 +13,8 @@
 #define REG_PACKAGE_IS_CONSTRUCTOR 0
 #define REG_OBJECTS_AS_GLOBALS 0
 #define OBJ_DATA_HIDDEN_METATABLE 1
-#define LUAJIT_FFI 1
 #define USE_FIELD_GET_SET_METHODS 0
+#define LUAJIT_FFI 1
 
 
 #include <sys/epoll.h>
@@ -205,14 +205,110 @@ typedef struct ffi_export_symbol {
 
 
 
+typedef int errno_rc;
+
+static void error_code__errno_rc__push(lua_State *L, errno_rc err);
+
 
 static obj_type obj_types[] = {
-#define obj_type_id_Epoller 0
+#define obj_type_id_Errors 0
+#define obj_type_Errors (obj_types[obj_type_id_Errors])
+  { NULL, 0, OBJ_TYPE_FLAG_WEAK_REF, "Errors" },
+#define obj_type_id_Epoller 1
 #define obj_type_Epoller (obj_types[obj_type_id_Epoller])
-  { NULL, 0, OBJ_TYPE_FLAG_WEAK_REF, "Epoller" },
+  { NULL, 1, OBJ_TYPE_FLAG_WEAK_REF, "Epoller" },
   {NULL, -1, 0, NULL},
 };
 
+
+#if LUAJIT_FFI
+static int nobj_udata_new_ffi(lua_State *L) {
+	size_t size = luaL_checkinteger(L, 1);
+	luaL_checktype(L, 2, LUA_TTABLE);
+	lua_settop(L, 2);
+	/* create userdata. */
+	lua_newuserdata(L, size);
+	lua_replace(L, 1);
+	/* set userdata's metatable. */
+	lua_setmetatable(L, 1);
+	return 1;
+}
+
+static const char nobj_ffi_support_key[] = "LuaNativeObject_FFI_SUPPORT";
+static const char nobj_check_ffi_support_code[] =
+"local stat, ffi=pcall(require,\"ffi\")\n" /* try loading LuaJIT`s FFI module. */
+"if not stat then return false end\n"
+"return true\n";
+
+static int nobj_check_ffi_support(lua_State *L) {
+	int rc;
+	int err;
+
+	/* check if ffi test has already been done. */
+	lua_pushstring(L, nobj_ffi_support_key);
+	lua_rawget(L, LUA_REGISTRYINDEX);
+	if(!lua_isnil(L, -1)) {
+		rc = lua_toboolean(L, -1);
+		lua_pop(L, 1);
+		return rc; /* return results of previous check. */
+	}
+	lua_pop(L, 1); /* pop nil. */
+
+	err = luaL_loadbuffer(L, nobj_check_ffi_support_code,
+		sizeof(nobj_check_ffi_support_code) - 1, nobj_ffi_support_key);
+	if(0 == err) {
+		err = lua_pcall(L, 0, 1, 0);
+	}
+	if(err) {
+		const char *msg = "<err not a string>";
+		if(lua_isstring(L, -1)) {
+			msg = lua_tostring(L, -1);
+		}
+		printf("Error when checking for FFI-support: %s\n", msg);
+		lua_pop(L, 1); /* pop error message. */
+		return 0;
+	}
+	/* check results of test. */
+	rc = lua_toboolean(L, -1);
+	lua_pop(L, 1); /* pop results. */
+		/* cache results. */
+	lua_pushstring(L, nobj_ffi_support_key);
+	lua_pushboolean(L, rc);
+	lua_rawset(L, LUA_REGISTRYINDEX);
+	return rc;
+}
+
+static int nobj_try_loading_ffi(lua_State *L, const char *ffi_mod_name,
+		const char *ffi_init_code, const ffi_export_symbol *ffi_exports, int priv_table)
+{
+	int err;
+
+	/* export symbols to priv_table. */
+	while(ffi_exports->name != NULL) {
+		lua_pushstring(L, ffi_exports->name);
+		lua_pushlightuserdata(L, ffi_exports->sym);
+		lua_settable(L, priv_table);
+		ffi_exports++;
+	}
+	err = luaL_loadbuffer(L, ffi_init_code, strlen(ffi_init_code), ffi_mod_name);
+	if(0 == err) {
+		lua_pushvalue(L, -2); /* dup C module's table. */
+		lua_pushvalue(L, priv_table); /* move priv_table to top of stack. */
+		lua_remove(L, priv_table);
+		lua_pushcfunction(L, nobj_udata_new_ffi);
+		err = lua_pcall(L, 3, 0, 0);
+	}
+	if(err) {
+		const char *msg = "<err not a string>";
+		if(lua_isstring(L, -1)) {
+			msg = lua_tostring(L, -1);
+		}
+		printf("Failed to install FFI-based bindings: %s\n", msg);
+		lua_pop(L, 1); /* pop error message. */
+	}
+	return err;
+}
+#endif
 
 #ifndef REG_PACKAGE_IS_CONSTRUCTOR
 #define REG_PACKAGE_IS_CONSTRUCTOR 1
@@ -485,10 +581,9 @@ static FUNC_UNUSED void * obj_simple_udata_luaoptional(lua_State *L, int _index,
 	return obj_simple_udata_luacheck(L, _index, type);
 }
 
-static FUNC_UNUSED void * obj_simple_udata_luadelete(lua_State *L, int _index, obj_type *type, int *flags) {
+static FUNC_UNUSED void * obj_simple_udata_luadelete(lua_State *L, int _index, obj_type *type) {
 	void *obj;
 	obj = obj_simple_udata_luacheck(L, _index, type);
-	*flags = OBJ_UDATA_FLAG_OWN;
 	/* clear the metatable to invalidate userdata. */
 	lua_pushnil(L);
 	lua_setmetatable(L, _index);
@@ -690,14 +785,10 @@ static void obj_type_register(lua_State *L, const reg_sub_module *type_reg, int 
 	lua_pushvalue(L, -2); /* dup metatable. */
 	lua_rawset(L, LUA_REGISTRYINDEX);    /* REGISTRY[type] = metatable */
 
-#if LUAJIT_FFI
 	/* add metatable to 'priv_table' */
 	lua_pushstring(L, type->name);
 	lua_pushvalue(L, -2); /* dup metatable. */
 	lua_rawset(L, priv_table);    /* priv_table["<object_name>"] = metatable */
-#else
-	(void)priv_table;
-#endif
 
 	luaL_register(L, NULL, type_reg->metas); /* fill metatable */
 
@@ -722,56 +813,6 @@ static void obj_type_register(lua_State *L, const reg_sub_module *type_reg, int 
 	lua_pop(L, 2);                      /* drop metatable & methods */
 }
 
-static FUNC_UNUSED int lua_checktype_ref(lua_State *L, int _index, int _type) {
-	luaL_checktype(L,_index,_type);
-	lua_pushvalue(L,_index);
-	return luaL_ref(L, LUA_REGISTRYINDEX);
-}
-
-#if LUAJIT_FFI
-static int nobj_udata_new_ffi(lua_State *L) {
-	size_t size = luaL_checkinteger(L, 1);
-	luaL_checktype(L, 2, LUA_TTABLE);
-	lua_settop(L, 2);
-	/* create userdata. */
-	lua_newuserdata(L, size);
-	lua_replace(L, 1);
-	/* set userdata's metatable. */
-	lua_setmetatable(L, 1);
-	return 1;
-}
-
-static int nobj_try_loading_ffi(lua_State *L, const char *ffi_mod_name,
-		const char *ffi_init_code, const ffi_export_symbol *ffi_exports, int priv_table)
-{
-	int err;
-
-	/* export symbols to priv_table. */
-	while(ffi_exports->name != NULL) {
-		lua_pushstring(L, ffi_exports->name);
-		lua_pushlightuserdata(L, ffi_exports->sym);
-		lua_settable(L, priv_table);
-		ffi_exports++;
-	}
-	err = luaL_loadbuffer(L, ffi_init_code, strlen(ffi_init_code), ffi_mod_name);
-	if(0 == err) {
-		lua_pushvalue(L, -2); /* dup C module's table. */
-		lua_pushvalue(L, priv_table); /* move priv_table to top of stack. */
-		lua_remove(L, priv_table);
-		lua_pushcfunction(L, nobj_udata_new_ffi);
-		err = lua_pcall(L, 3, 0, 0);
-	}
-	if(err) {
-		const char *msg = "<err not a string>";
-		if(lua_isstring(L, -1)) {
-			msg = lua_tostring(L, -1);
-		}
-		printf("Failed to install FFI-based bindings: %s\n", msg);
-		lua_pop(L, 1); /* pop error message. */
-	}
-	return err;
-}
-#endif
 
 
 #define obj_type_Epoller_check(L, _index) \
@@ -786,16 +827,36 @@ static int nobj_try_loading_ffi(lua_State *L, const char *ffi_mod_name,
 
 
 
-static const char epoll_ffi_lua_code[] = "local error = error\n"
+static const char epoll_ffi_lua_code[] = "local ffi=require\"ffi\"\n"
+"local function ffi_safe_load(name, global)\n"
+"	local stat, C = pcall(ffi.load, name, global)\n"
+"	if not stat then return nil, C end\n"
+"	return C\n"
+"end\n"
+"\n"
+"local error = error\n"
 "local type = type\n"
 "local tonumber = tonumber\n"
 "local tostring = tostring\n"
 "local rawset = rawset\n"
+"local p_config = package.config\n"
+"local p_cpath = package.cpath\n"
 "\n"
-"-- try loading luajit's ffi\n"
-"local stat, ffi=pcall(require,\"ffi\")\n"
-"if not stat then\n"
-"	return\n"
+"local function ffi_load_cmodule(name)\n"
+"	local dir_sep = p_config:sub(1,1)\n"
+"	local path_sep = p_config:sub(3,3)\n"
+"	local path_mark = p_config:sub(5,5)\n"
+"	local path_match = \"([^\" .. path_sep .. \"]*)\" .. path_sep\n"
+"	-- convert dotted name to directory path.\n"
+"	name = name:gsub('%.', dir_sep)\n"
+"	-- try each path in search path.\n"
+"	for path in p_cpath:gmatch(path_match) do\n"
+"		local fname = path:gsub(path_mark, name)\n"
+"		local C, err = ffi_safe_load(fname)\n"
+"		-- return opened library\n"
+"		if C then return C end\n"
+"	end\n"
+"	return nil, \"Failed to find: \" .. name\n"
 "end\n"
 "\n"
 "local _M, _priv, udata_new = ...\n"
@@ -846,6 +907,8 @@ static const char epoll_ffi_lua_code[] = "local error = error\n"
 "	void     *obj;\n"
 "	uint32_t flags;  /**< lua_own:1bit */\n"
 "} obj_udata;\n"
+"\n"
+"int memcmp(const void *s1, const void *s2, size_t n);\n"
 "\n"
 "]])\n"
 "\n"
@@ -983,7 +1046,6 @@ static const char epoll_ffi_lua_code[] = "local error = error\n"
 "local function obj_simple_udata_luadelete(ud_obj, type_mt)\n"
 "	-- invalid userdata, by setting the metatable to nil.\n"
 "	d_setmetatable(ud_obj, nil)\n"
-"	return OBJ_UDATA_FLAG_OWN\n"
 "end\n"
 "\n"
 "local function obj_simple_udata_luapush(c_obj, size, type_mt)\n"
@@ -998,7 +1060,12 @@ static const char epoll_ffi_lua_code[] = "local error = error\n"
 "	return ud_obj, cdata\n"
 "end\n"
 "\n"
+"-- Load C module\n"
+"local C = assert(ffi_load_cmodule(\"epoll\"))\n"
+"\n"
 "ffi.cdef[[\n"
+"typedef int errno_rc;\n"
+"\n"
 "typedef struct Epoller Epoller;\n"
 "\n"
 "]]\n"
@@ -1025,13 +1092,21 @@ static const char epoll_ffi_lua_code[] = "local error = error\n"
 "	struct epoll_event *events;\n"
 "} Epoller;\n"
 "\n"
-"typedef int (*epoller_add_func)(Epoller *this, int fd, uint32_t events, uint64_t id);\n"
+"int epoller_wait(Epoller *this, int timeout);\n"
 "\n"
-"typedef int (*epoller_mod_func)(Epoller *this, int fd, uint32_t events, uint64_t id);\n"
+"Epoller * epoller_create(int);\n"
 "\n"
-"typedef int (*epoller_del_func)(Epoller *this, int fd);\n"
+"void epoller_destroy(Epoller *);\n"
 "\n"
-"typedef int (*epoller_wait_func)(Epoller *this, int timeout);\n"
+"errno_rc epoller_add(Epoller *, int, uint32_t, uint64_t);\n"
+"\n"
+"errno_rc epoller_mod(Epoller *, int, uint32_t, uint64_t);\n"
+"\n"
+"errno_rc epoller_del(Epoller *, int);\n"
+"\n"
+"errno_rc epoller_wait(Epoller *, int);\n"
+"\n"
+"typedef Epoller * (*epoller_create_func)(int size);\n"
 "\n"
 "\n"
 "]]\n"
@@ -1054,51 +1129,107 @@ static const char epoll_ffi_lua_code[] = "local error = error\n"
 "local obj_type_Epoller_push\n"
 "\n"
 "do\n"
-"local Epoller_mt = _priv.Epoller\n"
-"local Epoller_objects = setmetatable({}, { __mode = \"k\",\n"
-"__index = function(objects, ud_obj)\n"
-"	return obj_udata_to_cdata(objects, ud_obj, \"Epoller *\", Epoller_mt)\n"
-"end,\n"
-"})\n"
-"function obj_type_Epoller_check(ud_obj)\n"
-"	return Epoller_objects[ud_obj]\n"
+"	local Epoller_mt = _priv.Epoller\n"
+"	ffi_safe_cdef(\"Epoller_simple_wrapper\", [=[\n"
+"		struct Epoller_t {\n"
+"			Epoller *ptr;\n"
+"			uint32_t       flags;\n"
+"		};\n"
+"		typedef struct Epoller_t Epoller_t;\n"
+"	]=])\n"
+"	local Epoller_objects = setmetatable({}, { __mode = \"k\",\n"
+"	__index = function(objects, ud_obj)\n"
+"		return obj_udata_to_cdata(objects, ud_obj, \"Epoller *\", Epoller_mt)\n"
+"	end,\n"
+"	})\n"
+"	function obj_type_Epoller_check(obj)\n"
+"		if ffi.istype(\"Epoller_t\", obj) then return obj.ptr end\n"
+"		return Epoller_objects[obj]\n"
+"	end\n"
+"\n"
+"	function obj_type_Epoller_delete(obj)\n"
+"		if ffi.istype(\"Epoller_t\", obj) then\n"
+"			local ptr, flags = obj.ptr, obj.flags\n"
+"			obj.ptr = nil\n"
+"			obj.flags = 0\n"
+"			return ptr, flags\n"
+"		end\n"
+"		Epoller_objects[obj] = nil\n"
+"		return obj_udata_luadelete_weak(obj, Epoller_mt)\n"
+"	end\n"
+"\n"
+"	function obj_type_Epoller_push(ptr, flags)\n"
+"		local obj = ffi.new(\"Epoller_t\")\n"
+"		obj.ptr = ptr\n"
+"		obj.flags = flags or 0\n"
+"		return obj\n"
+"	end\n"
+"\n"
+"	function Epoller_mt:__tostring()\n"
+"		return \"Epoller: \" .. tostring(self.ptr)\n"
+"	end\n"
+"\n"
+"	function Epoller_mt.__eq(val1, val2)\n"
+"		if not ffi.istype(\"Epoller_t\", val2) then return false end\n"
+"		return (val1.ptr == val2.ptr)\n"
+"	end\n"
 "end\n"
 "\n"
-"function obj_type_Epoller_delete(ud_obj)\n"
-"	Epoller_objects[ud_obj] = nil\n"
-"	return obj_udata_luadelete_weak(ud_obj, Epoller_mt)\n"
+"\n"
+"local epoller_create = ffi.new(\"epoller_create_func\", _priv[\"epoller_create\"])\n"
+"\n"
+"\n"
+"-- Start \"Errors\" FFI interface\n"
+"-- End \"Errors\" FFI interface\n"
+"\n"
+"-- get Errors table to map errno to error name.\n"
+"local Error_names = _M.Errors\n"
+"\n"
+"local function error_code__errno_rc__push(err)\n"
+"  local err_str\n"
+"	if(-1 == err) then\n"
+"		err_str = Error_names[ffi.errno()]\n"
+"	end\n"
+"\n"
+"	return err_str\n"
 "end\n"
-"\n"
-"local Epoller_type = ffi.cast(\"obj_type *\", Epoller_mt[\".type\"])\n"
-"function obj_type_Epoller_push(c_obj, flags)\n"
-"	local ud_obj = obj_udata_luapush_weak(c_obj, Epoller_mt, Epoller_type, flags)\n"
-"	Epoller_objects[ud_obj] = c_obj\n"
-"	return ud_obj\n"
-"end\n"
-"end\n"
-"\n"
-"\n"
-"local epoller_add = ffi.new(\"epoller_add_func\", _priv[\"epoller_add\"])\n"
-"\n"
-"local epoller_mod = ffi.new(\"epoller_mod_func\", _priv[\"epoller_mod\"])\n"
-"\n"
-"local epoller_del = ffi.new(\"epoller_del_func\", _priv[\"epoller_del\"])\n"
-"\n"
-"local epoller_wait = ffi.new(\"epoller_wait_func\", _priv[\"epoller_wait\"])\n"
 "\n"
 "\n"
 "-- Start \"Epoller\" FFI interface\n"
+"-- method: new\n"
+"function _pub.Epoller.new(size)\n"
+"    size = size or 64\n"
+"  local this_flags = OBJ_UDATA_FLAG_OWN\n"
+"  local this\n"
+"  this = C.epoller_create(size)\n"
+"  this =   obj_type_Epoller_push(this, this_flags)\n"
+"  return this\n"
+"end\n"
+"\n"
+"-- method: __gc\n"
+"function _priv.Epoller.__gc(self)\n"
+"  local this = obj_type_Epoller_delete(self)\n"
+"  C.epoller_destroy(this)\n"
+"  return \n"
+"end\n"
+"\n"
 "-- method: add\n"
 "function _meth.Epoller.add(self, fd, events, id)\n"
 "  local this = obj_type_Epoller_check(self)\n"
 "  \n"
 "  \n"
 "  \n"
-"  local rc\n"
-"	rc = epoller_add(this, fd, events, id);\n"
-"\n"
-"  rc = rc\n"
-"  return rc\n"
+"  local rc_epoller_add\n"
+"  rc_epoller_add = C.epoller_add(this, fd, events, id)\n"
+"  -- check for error.\n"
+"  local rc_epoller_add_err\n"
+"  if (-1 == rc_epoller_add) then\n"
+"    rc_epoller_add_err =   error_code__errno_rc__push(rc_epoller_add)\n"
+"    rc_epoller_add = nil\n"
+"  else\n"
+"    rc_epoller_add = true\n"
+"  end\n"
+"  return rc_epoller_add, rc_epoller_add_err\n"
 "end\n"
 "\n"
 "-- method: mod\n"
@@ -1107,22 +1238,34 @@ static const char epoll_ffi_lua_code[] = "local error = error\n"
 "  \n"
 "  \n"
 "  \n"
-"  local rc\n"
-"	rc = epoller_mod(this, fd, events, id);\n"
-"\n"
-"  rc = rc\n"
-"  return rc\n"
+"  local rc_epoller_mod\n"
+"  rc_epoller_mod = C.epoller_mod(this, fd, events, id)\n"
+"  -- check for error.\n"
+"  local rc_epoller_mod_err\n"
+"  if (-1 == rc_epoller_mod) then\n"
+"    rc_epoller_mod_err =   error_code__errno_rc__push(rc_epoller_mod)\n"
+"    rc_epoller_mod = nil\n"
+"  else\n"
+"    rc_epoller_mod = true\n"
+"  end\n"
+"  return rc_epoller_mod, rc_epoller_mod_err\n"
 "end\n"
 "\n"
 "-- method: del\n"
 "function _meth.Epoller.del(self, fd)\n"
 "  local this = obj_type_Epoller_check(self)\n"
 "  \n"
-"  local rc\n"
-"	rc = epoller_del(this, fd);\n"
-"\n"
-"  rc = rc\n"
-"  return rc\n"
+"  local rc_epoller_del\n"
+"  rc_epoller_del = C.epoller_del(this, fd)\n"
+"  -- check for error.\n"
+"  local rc_epoller_del_err\n"
+"  if (-1 == rc_epoller_del) then\n"
+"    rc_epoller_del_err =   error_code__errno_rc__push(rc_epoller_del)\n"
+"    rc_epoller_del = nil\n"
+"  else\n"
+"    rc_epoller_del = true\n"
+"  end\n"
+"  return rc_epoller_del, rc_epoller_del_err\n"
 "end\n"
 "\n"
 "-- method: wait\n"
@@ -1130,7 +1273,7 @@ static const char epoll_ffi_lua_code[] = "local error = error\n"
 "  local this = obj_type_Epoller_check(self)\n"
 "  \n"
 "  local rc\n"
-"	rc = epoller_wait(this, timeout);\n"
+"  rc = C.epoller_wait(this, timeout)\n"
 "	if (rc > 0) then\n"
 "		local idx = 1\n"
 "		-- fill 'events' table with event <id, events> pairs.\n"
@@ -1142,8 +1285,15 @@ static const char epoll_ffi_lua_code[] = "local error = error\n"
 "		end\n"
 "	end\n"
 "\n"
-"  rc = rc\n"
-"  return rc\n"
+"  -- check for error.\n"
+"  local rc_err\n"
+"  if (-1 == rc) then\n"
+"    rc_err =   error_code__errno_rc__push(rc)\n"
+"    rc = nil\n"
+"  else\n"
+"    rc = true\n"
+"  end\n"
+"  return rc, rc_err\n"
 "end\n"
 "\n"
 "-- method: wait_callback\n"
@@ -1151,7 +1301,7 @@ static const char epoll_ffi_lua_code[] = "local error = error\n"
 "  local this = obj_type_Epoller_check(self)\n"
 "  \n"
 "  local rc\n"
-"	rc = epoller_wait(this, timeout);\n"
+"  rc = C.epoller_wait(this, timeout)\n"
 "	if (rc > 0) then\n"
 "		-- call 'event_cb' for each <id, events> pair.\n"
 "		for n=0,(rc-1) do\n"
@@ -1159,13 +1309,32 @@ static const char epoll_ffi_lua_code[] = "local error = error\n"
 "		end\n"
 "	end\n"
 "\n"
-"  rc = rc\n"
-"  return rc\n"
+"  -- check for error.\n"
+"  local rc_err\n"
+"  if (-1 == rc) then\n"
+"    rc_err =   error_code__errno_rc__push(rc)\n"
+"    rc = nil\n"
+"  else\n"
+"    rc = true\n"
+"  end\n"
+"  return rc, rc_err\n"
 "end\n"
 "\n"
+"ffi.metatype(\"Epoller_t\", _priv.Epoller)\n"
 "-- End \"Epoller\" FFI interface\n"
 "\n"
+"-- method: new\n"
+"function _pub.epoll.new(size)\n"
+"    size = size or 64\n"
+"  local this_flags = OBJ_UDATA_FLAG_OWN\n"
+"  local this\n"
+"  this = epoller_create(size)\n"
+"  this =   obj_type_Epoller_push(this, this_flags)\n"
+"  return this\n"
+"end\n"
+"\n"
 "";
+static char *llnet_Errors_key = "llnet_Errors_key";
 
 typedef struct Epoller {
 	int epfd;
@@ -1173,6 +1342,8 @@ typedef struct Epoller {
 	int count;
 	struct epoll_event *events;
 } Epoller;
+
+int epoller_wait(Epoller *this, int timeout);
 
 #define EPOLLER_MIN_SIZE 20
 static void epoller_resize(Epoller *this, int newsize) {
@@ -1186,7 +1357,7 @@ static void epoller_grow(Epoller *this) {
 	epoller_resize(this, this->count + 50);
 }
 
-static Epoller *epoller_create(int size) {
+Epoller *epoller_create(int size) {
 	Epoller *this;
 
 	this = (Epoller *)calloc(1, sizeof(Epoller));
@@ -1203,7 +1374,7 @@ static Epoller *epoller_create(int size) {
 	return this;
 }
 
-static void epoller_destroy(Epoller *this) {
+void epoller_destroy(Epoller *this) {
 	close(this->epfd);
 	free(this->events);
 	free(this);
@@ -1216,35 +1387,90 @@ static int epoller_ctl(Epoller *this, int op, int fd, uint32_t events, uint64_t 
 	return epoll_ctl(this->epfd, op, fd, &event);
 }
 
-static int epoller_add(Epoller *this, int fd, uint32_t events, uint64_t id) {
+int epoller_add(Epoller *this, int fd, uint32_t events, uint64_t id) {
 	this->count++;
 	epoller_grow(this);
 	return epoller_ctl(this, EPOLL_CTL_ADD, fd, events, id);
 }
 
-static int epoller_mod(Epoller *this, int fd, uint32_t events, uint64_t id) {
+int epoller_mod(Epoller *this, int fd, uint32_t events, uint64_t id) {
 	return epoller_ctl(this, EPOLL_CTL_MOD, fd, events, id);
 }
 
-static int epoller_del(Epoller *this, int fd) {
+int epoller_del(Epoller *this, int fd) {
 	this->count--;
 	return epoller_ctl(this, EPOLL_CTL_DEL, fd, 0, 0);
 }
 
-static int epoller_wait(Epoller *this, int timeout) {
+int epoller_wait(Epoller *this, int timeout) {
 	return epoll_wait(this->epfd, this->events, this->size, timeout);
 }
 
 
 
 
+/* method: description */
+static int Errors__description__meth(lua_State *L) {
+  const char * msg = NULL;
+	int err_type;
+	int err_num = -1;
+
+	err_type = lua_type(L, 2);
+	if(err_type == LUA_TSTRING) {
+		lua_pushvalue(L, 2);
+		lua_rawget(L, 1);
+		if(lua_isnumber(L, -1)) {
+			err_num = lua_tointeger(L, -1);
+		}
+		lua_pop(L, 1);
+	} else if(err_type == LUA_TNUMBER) {
+		err_num = lua_tointeger(L, 2);
+	} else {
+		return luaL_argerror(L, 2, "expected string/number");
+	}
+	if(err_num < 0) {
+		lua_pushnil(L);
+		lua_pushliteral(L, "UNKNOWN ERROR");
+		return 2;
+	}
+	msg = strerror(err_num);
+
+  lua_pushstring(L, msg);
+  return 1;
+}
+
+static void error_code__errno_rc__push(lua_State *L, errno_rc err) {
+  const char *err_str = NULL;
+	if(-1 == err) {
+		/* get Errors table. */
+		lua_pushlightuserdata(L, llnet_Errors_key);
+		lua_rawget(L, LUA_REGISTRYINDEX);
+		/* convert errno to string. */
+		lua_rawgeti(L, -1, errno);
+		/* remove Errors table. */
+		lua_remove(L, -2);
+		if(!lua_isnil(L, -1)) {
+			/* found error. */
+			return;
+		}
+		/* Unknown error. */
+		lua_pop(L, 1);
+		err_str = "UNKNOWN ERROR";
+	}
+
+	if(err_str) {
+		lua_pushstring(L, err_str);
+	} else {
+		lua_pushnil(L);
+	}
+}
+
 /* method: new */
 static int Epoller__new__meth(lua_State *L) {
   int size = luaL_optinteger(L,1,64);
   int this_flags = OBJ_UDATA_FLAG_OWN;
   Epoller * this;
-	this = epoller_create(size);
-
+  this = epoller_create(size);
   obj_type_Epoller_push(L, this, this_flags);
   return 1;
 }
@@ -1254,8 +1480,7 @@ static int Epoller__delete__meth(lua_State *L) {
   int this_flags = 0;
   Epoller * this = obj_type_Epoller_delete(L,1,&(this_flags));
   if(!(this_flags & OBJ_UDATA_FLAG_OWN)) { return 0; }
-	epoller_destroy(this);
-
+  epoller_destroy(this);
   return 0;
 }
 
@@ -1265,11 +1490,17 @@ static int Epoller__add__meth(lua_State *L) {
   int fd = luaL_checkinteger(L,2);
   uint32_t events = luaL_checkinteger(L,3);
   uint64_t id = luaL_checkinteger(L,4);
-  int rc = 0;
-	rc = epoller_add(this, fd, events, id);
-
-  lua_pushinteger(L, rc);
-  return 1;
+  errno_rc rc_epoller_add = 0;
+  rc_epoller_add = epoller_add(this, fd, events, id);
+  /* check for error. */
+  if((-1 == rc_epoller_add)) {
+    lua_pushnil(L);
+      error_code__errno_rc__push(L, rc_epoller_add);
+  } else {
+    lua_pushboolean(L, 1);
+    lua_pushnil(L);
+  }
+  return 2;
 }
 
 /* method: mod */
@@ -1278,31 +1509,44 @@ static int Epoller__mod__meth(lua_State *L) {
   int fd = luaL_checkinteger(L,2);
   uint32_t events = luaL_checkinteger(L,3);
   uint64_t id = luaL_checkinteger(L,4);
-  int rc = 0;
-	rc = epoller_mod(this, fd, events, id);
-
-  lua_pushinteger(L, rc);
-  return 1;
+  errno_rc rc_epoller_mod = 0;
+  rc_epoller_mod = epoller_mod(this, fd, events, id);
+  /* check for error. */
+  if((-1 == rc_epoller_mod)) {
+    lua_pushnil(L);
+      error_code__errno_rc__push(L, rc_epoller_mod);
+  } else {
+    lua_pushboolean(L, 1);
+    lua_pushnil(L);
+  }
+  return 2;
 }
 
 /* method: del */
 static int Epoller__del__meth(lua_State *L) {
   Epoller * this = obj_type_Epoller_check(L,1);
   int fd = luaL_checkinteger(L,2);
-  int rc = 0;
-	rc = epoller_del(this, fd);
-
-  lua_pushinteger(L, rc);
-  return 1;
+  errno_rc rc_epoller_del = 0;
+  rc_epoller_del = epoller_del(this, fd);
+  /* check for error. */
+  if((-1 == rc_epoller_del)) {
+    lua_pushnil(L);
+      error_code__errno_rc__push(L, rc_epoller_del);
+  } else {
+    lua_pushboolean(L, 1);
+    lua_pushnil(L);
+  }
+  return 2;
 }
 
 /* method: wait */
 static int Epoller__wait__meth(lua_State *L) {
   Epoller * this = obj_type_Epoller_check(L,1);
   int timeout = luaL_checkinteger(L,3);
-  int rc = 0;
+  errno_rc rc = 0;
 	luaL_checktype(L, 2, LUA_TTABLE);
-	rc = epoller_wait(this, timeout);
+
+  rc = epoller_wait(this, timeout);
 	if(rc > 0) {
 		int idx;
 		int n;
@@ -1315,17 +1559,25 @@ static int Epoller__wait__meth(lua_State *L) {
 		}
 	}
 
-  lua_pushinteger(L, rc);
-  return 1;
+  /* check for error. */
+  if((-1 == rc)) {
+    lua_pushnil(L);
+      error_code__errno_rc__push(L, rc);
+  } else {
+    lua_pushboolean(L, 1);
+    lua_pushnil(L);
+  }
+  return 2;
 }
 
 /* method: wait_callback */
 static int Epoller__wait_callback__meth(lua_State *L) {
   Epoller * this = obj_type_Epoller_check(L,1);
   int timeout = luaL_checkinteger(L,3);
-  int rc = 0;
+  errno_rc rc = 0;
 	luaL_checktype(L, 2, LUA_TFUNCTION);
-	rc = epoller_wait(this, timeout);
+
+  rc = epoller_wait(this, timeout);
 	if(rc > 0) {
 		int n;
 		/* call 'event_cb' for each <id, events> pair. */
@@ -1337,8 +1589,15 @@ static int Epoller__wait_callback__meth(lua_State *L) {
 		}
 	}
 
-  lua_pushinteger(L, rc);
-  return 1;
+  /* check for error. */
+  if((-1 == rc)) {
+    lua_pushnil(L);
+      error_code__errno_rc__push(L, rc);
+  } else {
+    lua_pushboolean(L, 1);
+    lua_pushnil(L);
+  }
+  return 2;
 }
 
 /* method: new */
@@ -1346,13 +1605,425 @@ static int epoll__new__func(lua_State *L) {
   int size = luaL_optinteger(L,1,64);
   int this_flags = OBJ_UDATA_FLAG_OWN;
   Epoller * this;
-	this = epoller_create(size);
-
+  this = epoller_create(size);
   obj_type_Epoller_push(L, this, this_flags);
   return 1;
 }
 
 
+
+static const luaL_reg obj_Errors_pub_funcs[] = {
+  {NULL, NULL}
+};
+
+static const luaL_reg obj_Errors_methods[] = {
+  {"description", Errors__description__meth},
+  {NULL, NULL}
+};
+
+static const luaL_reg obj_Errors_metas[] = {
+  {NULL, NULL}
+};
+
+static const obj_const obj_Errors_constants[] = {
+#ifdef ELNRNG
+  {"ELNRNG", NULL, ELNRNG, CONST_NUMBER},
+#endif
+#ifdef EPFNOSUPPORT
+  {"EPFNOSUPPORT", NULL, EPFNOSUPPORT, CONST_NUMBER},
+#endif
+#ifdef EBADR
+  {"EBADR", NULL, EBADR, CONST_NUMBER},
+#endif
+#ifdef ENOLINK
+  {"ENOLINK", NULL, ENOLINK, CONST_NUMBER},
+#endif
+#ifdef ENOMSG
+  {"ENOMSG", NULL, ENOMSG, CONST_NUMBER},
+#endif
+#ifdef ERESTART
+  {"ERESTART", NULL, ERESTART, CONST_NUMBER},
+#endif
+#ifdef EUCLEAN
+  {"EUCLEAN", NULL, EUCLEAN, CONST_NUMBER},
+#endif
+#ifdef ELIBSCN
+  {"ELIBSCN", NULL, ELIBSCN, CONST_NUMBER},
+#endif
+#ifdef EROFS
+  {"EROFS", NULL, EROFS, CONST_NUMBER},
+#endif
+#ifdef EBADE
+  {"EBADE", NULL, EBADE, CONST_NUMBER},
+#endif
+#ifdef ENOTSOCK
+  {"ENOTSOCK", NULL, ENOTSOCK, CONST_NUMBER},
+#endif
+#ifdef ENOTCONN
+  {"ENOTCONN", NULL, ENOTCONN, CONST_NUMBER},
+#endif
+#ifdef EREMOTE
+  {"EREMOTE", NULL, EREMOTE, CONST_NUMBER},
+#endif
+#ifdef ECOMM
+  {"ECOMM", NULL, ECOMM, CONST_NUMBER},
+#endif
+#ifdef ENODATA
+  {"ENODATA", NULL, ENODATA, CONST_NUMBER},
+#endif
+#ifdef EPERM
+  {"EPERM", NULL, EPERM, CONST_NUMBER},
+#endif
+#ifdef EBADRQC
+  {"EBADRQC", NULL, EBADRQC, CONST_NUMBER},
+#endif
+#ifdef ENOSPC
+  {"ENOSPC", NULL, ENOSPC, CONST_NUMBER},
+#endif
+#ifdef ELIBMAX
+  {"ELIBMAX", NULL, ELIBMAX, CONST_NUMBER},
+#endif
+#ifdef EDOTDOT
+  {"EDOTDOT", NULL, EDOTDOT, CONST_NUMBER},
+#endif
+#ifdef ENOPROTOOPT
+  {"ENOPROTOOPT", NULL, ENOPROTOOPT, CONST_NUMBER},
+#endif
+#ifdef EBFONT
+  {"EBFONT", NULL, EBFONT, CONST_NUMBER},
+#endif
+#ifdef EKEYREVOKED
+  {"EKEYREVOKED", NULL, EKEYREVOKED, CONST_NUMBER},
+#endif
+#ifdef ESRMNT
+  {"ESRMNT", NULL, ESRMNT, CONST_NUMBER},
+#endif
+#ifdef EOVERFLOW
+  {"EOVERFLOW", NULL, EOVERFLOW, CONST_NUMBER},
+#endif
+#ifdef EDQUOT
+  {"EDQUOT", NULL, EDQUOT, CONST_NUMBER},
+#endif
+#ifdef EFBIG
+  {"EFBIG", NULL, EFBIG, CONST_NUMBER},
+#endif
+#ifdef EIDRM
+  {"EIDRM", NULL, EIDRM, CONST_NUMBER},
+#endif
+#ifdef EDOM
+  {"EDOM", NULL, EDOM, CONST_NUMBER},
+#endif
+#ifdef EPROTO
+  {"EPROTO", NULL, EPROTO, CONST_NUMBER},
+#endif
+#ifdef EMULTIHOP
+  {"EMULTIHOP", NULL, EMULTIHOP, CONST_NUMBER},
+#endif
+#ifdef EBUSY
+  {"EBUSY", NULL, EBUSY, CONST_NUMBER},
+#endif
+#ifdef EDEADLOCK
+  {"EDEADLOCK", NULL, EDEADLOCK, CONST_NUMBER},
+#endif
+#ifdef ENOPKG
+  {"ENOPKG", NULL, ENOPKG, CONST_NUMBER},
+#endif
+#ifdef EPIPE
+  {"EPIPE", NULL, EPIPE, CONST_NUMBER},
+#endif
+#ifdef EADDRINUSE
+  {"EADDRINUSE", NULL, EADDRINUSE, CONST_NUMBER},
+#endif
+#ifdef EFAULT
+  {"EFAULT", NULL, EFAULT, CONST_NUMBER},
+#endif
+#ifdef EDEADLK
+  {"EDEADLK", NULL, EDEADLK, CONST_NUMBER},
+#endif
+#ifdef ENFILE
+  {"ENFILE", NULL, ENFILE, CONST_NUMBER},
+#endif
+#ifdef EAGAIN
+  {"EAGAIN", NULL, EAGAIN, CONST_NUMBER},
+#endif
+#ifdef ECONNABORTED
+  {"ECONNABORTED", NULL, ECONNABORTED, CONST_NUMBER},
+#endif
+#ifdef EMLINK
+  {"EMLINK", NULL, EMLINK, CONST_NUMBER},
+#endif
+#ifdef EBADMSG
+  {"EBADMSG", NULL, EBADMSG, CONST_NUMBER},
+#endif
+#ifdef ERFKILL
+  {"ERFKILL", NULL, ERFKILL, CONST_NUMBER},
+#endif
+#ifdef ENOTTY
+  {"ENOTTY", NULL, ENOTTY, CONST_NUMBER},
+#endif
+#ifdef ELIBACC
+  {"ELIBACC", NULL, ELIBACC, CONST_NUMBER},
+#endif
+#ifdef ETIME
+  {"ETIME", NULL, ETIME, CONST_NUMBER},
+#endif
+#ifdef ECHILD
+  {"ECHILD", NULL, ECHILD, CONST_NUMBER},
+#endif
+#ifdef ENOTRECOVERABLE
+  {"ENOTRECOVERABLE", NULL, ENOTRECOVERABLE, CONST_NUMBER},
+#endif
+#ifdef EISCONN
+  {"EISCONN", NULL, EISCONN, CONST_NUMBER},
+#endif
+#ifdef ENAVAIL
+  {"ENAVAIL", NULL, ENAVAIL, CONST_NUMBER},
+#endif
+#ifdef EDESTADDRREQ
+  {"EDESTADDRREQ", NULL, EDESTADDRREQ, CONST_NUMBER},
+#endif
+#ifdef EREMOTEIO
+  {"EREMOTEIO", NULL, EREMOTEIO, CONST_NUMBER},
+#endif
+#ifdef ESTALE
+  {"ESTALE", NULL, ESTALE, CONST_NUMBER},
+#endif
+#ifdef ESTRPIPE
+  {"ESTRPIPE", NULL, ESTRPIPE, CONST_NUMBER},
+#endif
+#ifdef EHOSTUNREACH
+  {"EHOSTUNREACH", NULL, EHOSTUNREACH, CONST_NUMBER},
+#endif
+#ifdef ENOTBLK
+  {"ENOTBLK", NULL, ENOTBLK, CONST_NUMBER},
+#endif
+#ifdef EEXIST
+  {"EEXIST", NULL, EEXIST, CONST_NUMBER},
+#endif
+#ifdef ENOTDIR
+  {"ENOTDIR", NULL, ENOTDIR, CONST_NUMBER},
+#endif
+#ifdef EWOULDBLOCK
+  {"EWOULDBLOCK", NULL, EWOULDBLOCK, CONST_NUMBER},
+#endif
+#ifdef EREMCHG
+  {"EREMCHG", NULL, EREMCHG, CONST_NUMBER},
+#endif
+#ifdef ELOOP
+  {"ELOOP", NULL, ELOOP, CONST_NUMBER},
+#endif
+#ifdef ENOTUNIQ
+  {"ENOTUNIQ", NULL, ENOTUNIQ, CONST_NUMBER},
+#endif
+#ifdef EMEDIUMTYPE
+  {"EMEDIUMTYPE", NULL, EMEDIUMTYPE, CONST_NUMBER},
+#endif
+#ifdef ENOLCK
+  {"ENOLCK", NULL, ENOLCK, CONST_NUMBER},
+#endif
+#ifdef EUNATCH
+  {"EUNATCH", NULL, EUNATCH, CONST_NUMBER},
+#endif
+#ifdef EPROTONOSUPPORT
+  {"EPROTONOSUPPORT", NULL, EPROTONOSUPPORT, CONST_NUMBER},
+#endif
+#ifdef EHOSTDOWN
+  {"EHOSTDOWN", NULL, EHOSTDOWN, CONST_NUMBER},
+#endif
+#ifdef ENXIO
+  {"ENXIO", NULL, ENXIO, CONST_NUMBER},
+#endif
+#ifdef ECONNRESET
+  {"ECONNRESET", NULL, ECONNRESET, CONST_NUMBER},
+#endif
+#ifdef EOWNERDEAD
+  {"EOWNERDEAD", NULL, EOWNERDEAD, CONST_NUMBER},
+#endif
+#ifdef EL2HLT
+  {"EL2HLT", NULL, EL2HLT, CONST_NUMBER},
+#endif
+#ifdef EBADSLT
+  {"EBADSLT", NULL, EBADSLT, CONST_NUMBER},
+#endif
+#ifdef ESHUTDOWN
+  {"ESHUTDOWN", NULL, ESHUTDOWN, CONST_NUMBER},
+#endif
+#ifdef EIO
+  {"EIO", NULL, EIO, CONST_NUMBER},
+#endif
+#ifdef ENOANO
+  {"ENOANO", NULL, ENOANO, CONST_NUMBER},
+#endif
+#ifdef EACCES
+  {"EACCES", NULL, EACCES, CONST_NUMBER},
+#endif
+#ifdef EOPNOTSUPP
+  {"EOPNOTSUPP", NULL, EOPNOTSUPP, CONST_NUMBER},
+#endif
+#ifdef EKEYREJECTED
+  {"EKEYREJECTED", NULL, EKEYREJECTED, CONST_NUMBER},
+#endif
+#ifdef EL3HLT
+  {"EL3HLT", NULL, EL3HLT, CONST_NUMBER},
+#endif
+#ifdef ELIBBAD
+  {"ELIBBAD", NULL, ELIBBAD, CONST_NUMBER},
+#endif
+#ifdef ENODEV
+  {"ENODEV", NULL, ENODEV, CONST_NUMBER},
+#endif
+#ifdef ENOSR
+  {"ENOSR", NULL, ENOSR, CONST_NUMBER},
+#endif
+#ifdef ENOBUFS
+  {"ENOBUFS", NULL, ENOBUFS, CONST_NUMBER},
+#endif
+#ifdef ENETUNREACH
+  {"ENETUNREACH", NULL, ENETUNREACH, CONST_NUMBER},
+#endif
+#ifdef ENOKEY
+  {"ENOKEY", NULL, ENOKEY, CONST_NUMBER},
+#endif
+#ifdef ECANCELED
+  {"ECANCELED", NULL, ECANCELED, CONST_NUMBER},
+#endif
+#ifdef ENETRESET
+  {"ENETRESET", NULL, ENETRESET, CONST_NUMBER},
+#endif
+#ifdef ENOENT
+  {"ENOENT", NULL, ENOENT, CONST_NUMBER},
+#endif
+#ifdef ENOSTR
+  {"ENOSTR", NULL, ENOSTR, CONST_NUMBER},
+#endif
+#ifdef EL3RST
+  {"EL3RST", NULL, EL3RST, CONST_NUMBER},
+#endif
+#ifdef EMFILE
+  {"EMFILE", NULL, EMFILE, CONST_NUMBER},
+#endif
+#ifdef ENOEXEC
+  {"ENOEXEC", NULL, ENOEXEC, CONST_NUMBER},
+#endif
+#ifdef ENOTEMPTY
+  {"ENOTEMPTY", NULL, ENOTEMPTY, CONST_NUMBER},
+#endif
+#ifdef EINVAL
+  {"EINVAL", NULL, EINVAL, CONST_NUMBER},
+#endif
+#ifdef ERANGE
+  {"ERANGE", NULL, ERANGE, CONST_NUMBER},
+#endif
+#ifdef ENONET
+  {"ENONET", NULL, ENONET, CONST_NUMBER},
+#endif
+#ifdef EISNAM
+  {"EISNAM", NULL, EISNAM, CONST_NUMBER},
+#endif
+#ifdef E2BIG
+  {"E2BIG", NULL, E2BIG, CONST_NUMBER},
+#endif
+#ifdef ENOTNAM
+  {"ENOTNAM", NULL, ENOTNAM, CONST_NUMBER},
+#endif
+#ifdef ETOOMANYREFS
+  {"ETOOMANYREFS", NULL, ETOOMANYREFS, CONST_NUMBER},
+#endif
+#ifdef EADDRNOTAVAIL
+  {"EADDRNOTAVAIL", NULL, EADDRNOTAVAIL, CONST_NUMBER},
+#endif
+#ifdef ENOSYS
+  {"ENOSYS", NULL, ENOSYS, CONST_NUMBER},
+#endif
+#ifdef EINPROGRESS
+  {"EINPROGRESS", NULL, EINPROGRESS, CONST_NUMBER},
+#endif
+#ifdef ETIMEDOUT
+  {"ETIMEDOUT", NULL, ETIMEDOUT, CONST_NUMBER},
+#endif
+#ifdef EBADFD
+  {"EBADFD", NULL, EBADFD, CONST_NUMBER},
+#endif
+#ifdef EISDIR
+  {"EISDIR", NULL, EISDIR, CONST_NUMBER},
+#endif
+#ifdef EADV
+  {"EADV", NULL, EADV, CONST_NUMBER},
+#endif
+#ifdef EINTR
+  {"EINTR", NULL, EINTR, CONST_NUMBER},
+#endif
+#ifdef ESRCH
+  {"ESRCH", NULL, ESRCH, CONST_NUMBER},
+#endif
+#ifdef ESOCKTNOSUPPORT
+  {"ESOCKTNOSUPPORT", NULL, ESOCKTNOSUPPORT, CONST_NUMBER},
+#endif
+#ifdef EXFULL
+  {"EXFULL", NULL, EXFULL, CONST_NUMBER},
+#endif
+#ifdef EPROTOTYPE
+  {"EPROTOTYPE", NULL, EPROTOTYPE, CONST_NUMBER},
+#endif
+#ifdef EUSERS
+  {"EUSERS", NULL, EUSERS, CONST_NUMBER},
+#endif
+#ifdef ENETDOWN
+  {"ENETDOWN", NULL, ENETDOWN, CONST_NUMBER},
+#endif
+#ifdef EAFNOSUPPORT
+  {"EAFNOSUPPORT", NULL, EAFNOSUPPORT, CONST_NUMBER},
+#endif
+#ifdef ESPIPE
+  {"ESPIPE", NULL, ESPIPE, CONST_NUMBER},
+#endif
+#ifdef ETXTBSY
+  {"ETXTBSY", NULL, ETXTBSY, CONST_NUMBER},
+#endif
+#ifdef ECHRNG
+  {"ECHRNG", NULL, ECHRNG, CONST_NUMBER},
+#endif
+#ifdef ENOMEM
+  {"ENOMEM", NULL, ENOMEM, CONST_NUMBER},
+#endif
+#ifdef ECONNREFUSED
+  {"ECONNREFUSED", NULL, ECONNREFUSED, CONST_NUMBER},
+#endif
+#ifdef EMSGSIZE
+  {"EMSGSIZE", NULL, EMSGSIZE, CONST_NUMBER},
+#endif
+#ifdef EKEYEXPIRED
+  {"EKEYEXPIRED", NULL, EKEYEXPIRED, CONST_NUMBER},
+#endif
+#ifdef ENOMEDIUM
+  {"ENOMEDIUM", NULL, ENOMEDIUM, CONST_NUMBER},
+#endif
+#ifdef EILSEQ
+  {"EILSEQ", NULL, EILSEQ, CONST_NUMBER},
+#endif
+#ifdef ELIBEXEC
+  {"ELIBEXEC", NULL, ELIBEXEC, CONST_NUMBER},
+#endif
+#ifdef ENOCSI
+  {"ENOCSI", NULL, ENOCSI, CONST_NUMBER},
+#endif
+#ifdef EALREADY
+  {"EALREADY", NULL, EALREADY, CONST_NUMBER},
+#endif
+#ifdef ENAMETOOLONG
+  {"ENAMETOOLONG", NULL, ENAMETOOLONG, CONST_NUMBER},
+#endif
+#ifdef EBADF
+  {"EBADF", NULL, EBADF, CONST_NUMBER},
+#endif
+#ifdef EXDEV
+  {"EXDEV", NULL, EXDEV, CONST_NUMBER},
+#endif
+#ifdef EL2NSYNC
+  {"EL2NSYNC", NULL, EL2NSYNC, CONST_NUMBER},
+#endif
+  {NULL, NULL, 0.0 , 0}
+};
 
 static const luaL_reg obj_Epoller_pub_funcs[] = {
   {"new", Epoller__new__meth},
@@ -1417,23 +2088,22 @@ static const obj_const epoll_constants[] = {
   {NULL, NULL, 0.0 , 0}
 };
 
-static const ffi_export_symbol epoll_ffi_export[] = {
-{ "epoller_add", epoller_add },
-{ "epoller_mod", epoller_mod },
-{ "epoller_del", epoller_del },
-{ "epoller_wait", epoller_wait },
-  {NULL, NULL}
-};
-
 
 
 static const reg_sub_module reg_sub_modules[] = {
+  { &(obj_type_Errors), REG_META, obj_Errors_pub_funcs, obj_Errors_methods, obj_Errors_metas, NULL, NULL, obj_Errors_constants, true},
   { &(obj_type_Epoller), REG_OBJECT, obj_Epoller_pub_funcs, obj_Epoller_methods, obj_Epoller_metas, obj_Epoller_bases, obj_Epoller_fields, obj_Epoller_constants, false},
   {NULL, 0, NULL, NULL, NULL, NULL, NULL, NULL, false}
 };
 
 
 
+
+
+static const ffi_export_symbol epoll_ffi_export[] = {
+{ "epoller_create", epoller_create },
+  {NULL, NULL}
+};
 
 
 
@@ -1468,11 +2138,9 @@ LUA_NOBJ_API int luaopen_epoll(lua_State *L) {
 	const luaL_Reg *submodules = submodule_libs;
 	int priv_table = -1;
 
-#if LUAJIT_FFI
 	/* private table to hold reference to object metatables. */
 	lua_newtable(L);
 	priv_table = lua_gettop(L);
-#endif
 
 	/* create object cache. */
 	create_object_instance_cache(L);
@@ -1501,12 +2169,20 @@ LUA_NOBJ_API int luaopen_epoll(lua_State *L) {
 		obj_type_register(L, reg, priv_table);
 	}
 
-
-
 #if LUAJIT_FFI
-	nobj_try_loading_ffi(L, "epoll", epoll_ffi_lua_code,
-		epoll_ffi_export, priv_table);
+	if(nobj_check_ffi_support(L)) {
+		nobj_try_loading_ffi(L, "epoll", epoll_ffi_lua_code,
+			epoll_ffi_export, priv_table);
+	}
 #endif
+
+	/* Cache reference to llnet.Errors table for errno->string convertion. */
+	lua_pushlightuserdata(L, llnet_Errors_key);
+	lua_getfield(L, -2, "Errors");
+	lua_rawset(L, LUA_REGISTRYINDEX);
+
+
+
 	return 1;
 }
 
