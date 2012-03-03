@@ -120,7 +120,7 @@ int epoller_wait(Epoller *this, int timeout) {
 		var_in{ "int", "size", is_optional = true, default = 64 },
 		c_call "Epoller *" "epoller_create" { "int", "size"},
   },
-  destructor {
+  destructor "close" {
 		c_method_call "void" "epoller_destroy" {},
   },
 

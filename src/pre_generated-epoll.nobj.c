@@ -11,6 +11,7 @@
 #include "lualib.h"
 
 #define REG_PACKAGE_IS_CONSTRUCTOR 0
+#define REG_MODULES_AS_GLOBALS 0
 #define REG_OBJECTS_AS_GLOBALS 0
 #define OBJ_DATA_HIDDEN_METATABLE 1
 #define USE_FIELD_GET_SET_METHODS 0
@@ -40,6 +41,7 @@
 /* for MinGW32 compiler need to include <stdint.h> */
 #ifdef __GNUC__
 #include <stdint.h>
+#include <stdbool.h>
 #else
 
 /* define some standard types missing on Windows. */
@@ -56,7 +58,7 @@ typedef int bool;
 #define true 1
 #endif
 #ifndef false
-#define false 1
+#define false 0
 #endif
 
 #endif
@@ -97,19 +99,26 @@ typedef int bool;
 #define assert_obj_type(type, obj)
 #endif
 
-#ifndef obj_type_free
+void *nobj_realloc(void *ptr, size_t osize, size_t nsize);
+
+void *nobj_realloc(void *ptr, size_t osize, size_t nsize) {
+	(void)osize;
+	if(0 == nsize) {
+		free(ptr);
+		return NULL;
+	}
+	return realloc(ptr, nsize);
+}
+
 #define obj_type_free(type, obj) do { \
 	assert_obj_type(type, obj); \
-	free((obj)); \
+	nobj_realloc((obj), sizeof(type), 0); \
 } while(0)
-#endif
 
-#ifndef obj_type_new
 #define obj_type_new(type, obj) do { \
 	assert_obj_type(type, obj); \
-	(obj) = malloc(sizeof(type)); \
+	(obj) = nobj_realloc(NULL, 0, sizeof(type)); \
 } while(0)
-#endif
 
 typedef struct obj_type obj_type;
 
@@ -182,7 +191,7 @@ typedef struct reg_sub_module {
 	const obj_base  *bases;
 	const obj_field *fields;
 	const obj_const *constants;
-	bool            bidirectional_consts;
+	int             bidirectional_consts;
 } reg_sub_module;
 
 #define OBJ_UDATA_FLAG_OWN (1<<0)
@@ -200,9 +209,13 @@ static char obj_udata_weak_ref_key[] = "obj_udata_weak_ref_key";
 static char obj_udata_private_key[] = "obj_udata_private_key";
 
 #if LUAJIT_FFI
+typedef int (*ffi_export_func_t)(void);
 typedef struct ffi_export_symbol {
 	const char *name;
-	void       *sym;
+	union {
+	void               *data;
+	ffi_export_func_t  func;
+	} sym;
 } ffi_export_symbol;
 #endif
 
@@ -225,18 +238,10 @@ static obj_type obj_types[] = {
 
 
 #if LUAJIT_FFI
-static int nobj_udata_new_ffi(lua_State *L) {
-	size_t size = luaL_checkinteger(L, 1);
-	luaL_checktype(L, 2, LUA_TTABLE);
-	lua_settop(L, 2);
-	/* create userdata. */
-	lua_newuserdata(L, size);
-	lua_replace(L, 1);
-	/* set userdata's metatable. */
-	lua_setmetatable(L, 1);
-	return 1;
-}
 
+/* nobj_ffi_support_enabled_hint should be set to 1 when FFI support is enabled in at-least one
+ * instance of a LuaJIT state.  It should never be set back to 0. */
+static int nobj_ffi_support_enabled_hint = 0;
 static const char nobj_ffi_support_key[] = "LuaNativeObject_FFI_SUPPORT";
 static const char nobj_check_ffi_support_code[] =
 "local stat, ffi=pcall(require,\"ffi\")\n" /* try loading LuaJIT`s FFI module. */
@@ -253,7 +258,8 @@ static int nobj_check_ffi_support(lua_State *L) {
 	if(!lua_isnil(L, -1)) {
 		rc = lua_toboolean(L, -1);
 		lua_pop(L, 1);
-		return rc; /* return results of previous check. */
+		/* use results of previous check. */
+		goto finished;
 	}
 	lua_pop(L, 1); /* pop nil. */
 
@@ -278,27 +284,54 @@ static int nobj_check_ffi_support(lua_State *L) {
 	lua_pushstring(L, nobj_ffi_support_key);
 	lua_pushboolean(L, rc);
 	lua_rawset(L, LUA_REGISTRYINDEX);
+
+finished:
+	/* turn-on hint that there is FFI code enabled. */
+	if(rc) {
+		nobj_ffi_support_enabled_hint = 1;
+	}
+
 	return rc;
 }
 
+typedef struct {
+	const char **ffi_init_code;
+	int offset;
+} nobj_reader_state;
+
+static const char *nobj_lua_Reader(lua_State *L, void *data, size_t *size) {
+	nobj_reader_state *state = (nobj_reader_state *)data;
+	const char *ptr;
+
+	ptr = state->ffi_init_code[state->offset];
+	if(ptr != NULL) {
+		*size = strlen(ptr);
+		state->offset++;
+	} else {
+		*size = 0;
+	}
+	return ptr;
+}
+
 static int nobj_try_loading_ffi(lua_State *L, const char *ffi_mod_name,
-		const char *ffi_init_code, const ffi_export_symbol *ffi_exports, int priv_table)
+		const char *ffi_init_code[], const ffi_export_symbol *ffi_exports, int priv_table)
 {
+	nobj_reader_state state = { ffi_init_code, 0 };
 	int err;
 
 	/* export symbols to priv_table. */
 	while(ffi_exports->name != NULL) {
 		lua_pushstring(L, ffi_exports->name);
-		lua_pushlightuserdata(L, ffi_exports->sym);
+		lua_pushlightuserdata(L, ffi_exports->sym.data);
 		lua_settable(L, priv_table);
 		ffi_exports++;
 	}
-	err = luaL_loadbuffer(L, ffi_init_code, strlen(ffi_init_code), ffi_mod_name);
+	err = lua_load(L, nobj_lua_Reader, &state, ffi_mod_name);
 	if(0 == err) {
 		lua_pushvalue(L, -2); /* dup C module's table. */
 		lua_pushvalue(L, priv_table); /* move priv_table to top of stack. */
 		lua_remove(L, priv_table);
-		lua_pushcfunction(L, nobj_udata_new_ffi);
+		lua_pushvalue(L, LUA_REGISTRYINDEX);
 		err = lua_pcall(L, 3, 0, 0);
 	}
 	if(err) {
@@ -315,6 +348,10 @@ static int nobj_try_loading_ffi(lua_State *L, const char *ffi_mod_name,
 
 #ifndef REG_PACKAGE_IS_CONSTRUCTOR
 #define REG_PACKAGE_IS_CONSTRUCTOR 1
+#endif
+
+#ifndef REG_MODULES_AS_GLOBALS
+#define REG_MODULES_AS_GLOBALS 0
 #endif
 
 #ifndef REG_OBJECTS_AS_GLOBALS
@@ -463,6 +500,17 @@ static FUNC_UNUSED void obj_udata_luapush(lua_State *L, void *obj, obj_type *typ
 		lua_pushnil(L);
 		return;
 	}
+#if LUAJIT_FFI
+	lua_pushlightuserdata(L, type);
+	lua_rawget(L, LUA_REGISTRYINDEX); /* type's metatable. */
+	if(nobj_ffi_support_enabled_hint && lua_isfunction(L, -1)) {
+		/* call special FFI "void *" to FFI object convertion function. */
+		lua_pushlightuserdata(L, obj);
+		lua_pushinteger(L, flags);
+		lua_call(L, 2, 1);
+		return;
+	}
+#endif
 	/* check for type caster. */
 	if(type->dcaster) {
 		(type->dcaster)(&obj, &type);
@@ -472,8 +520,12 @@ static FUNC_UNUSED void obj_udata_luapush(lua_State *L, void *obj, obj_type *typ
 	ud->obj = obj;
 	ud->flags = flags;
 	/* get obj_type metatable. */
+#if LUAJIT_FFI
+	lua_insert(L, -2); /* move userdata below metatable. */
+#else
 	lua_pushlightuserdata(L, type);
 	lua_rawget(L, LUA_REGISTRYINDEX); /* type's metatable. */
+#endif
 	lua_setmetatable(L, -2);
 }
 
@@ -519,6 +571,18 @@ static FUNC_UNUSED void obj_udata_luapush_weak(lua_State *L, void *obj, obj_type
 	}
 	lua_pop(L, 1);  /* pop nil. */
 
+#if LUAJIT_FFI
+	lua_pushlightuserdata(L, type);
+	lua_rawget(L, LUA_REGISTRYINDEX); /* type's metatable. */
+	if(nobj_ffi_support_enabled_hint && lua_isfunction(L, -1)) {
+		lua_remove(L, -2);
+		/* call special FFI "void *" to FFI object convertion function. */
+		lua_pushlightuserdata(L, obj);
+		lua_pushinteger(L, flags);
+		lua_call(L, 2, 1);
+		return;
+	}
+#endif
 	/* create new userdata. */
 	ud = (obj_udata *)lua_newuserdata(L, sizeof(obj_udata));
 
@@ -526,8 +590,12 @@ static FUNC_UNUSED void obj_udata_luapush_weak(lua_State *L, void *obj, obj_type
 	ud->obj = obj;
 	ud->flags = flags;
 	/* get obj_type metatable. */
+#if LUAJIT_FFI
+	lua_insert(L, -2); /* move userdata below metatable. */
+#else
 	lua_pushlightuserdata(L, type);
 	lua_rawget(L, LUA_REGISTRYINDEX); /* type's metatable. */
+#endif
 	lua_setmetatable(L, -2);
 
 	/* add weak reference to object. */
@@ -632,12 +700,27 @@ static FUNC_UNUSED void * obj_simple_udata_luadelete(lua_State *L, int _index, o
 
 static FUNC_UNUSED void *obj_simple_udata_luapush(lua_State *L, void *obj, int size, obj_type *type)
 {
-	/* create new userdata. */
-	void *ud = lua_newuserdata(L, size);
-	memcpy(ud, obj, size);
-	/* get obj_type metatable. */
+	void *ud;
+#if LUAJIT_FFI
 	lua_pushlightuserdata(L, type);
 	lua_rawget(L, LUA_REGISTRYINDEX); /* type's metatable. */
+	if(nobj_ffi_support_enabled_hint && lua_isfunction(L, -1)) {
+		/* call special FFI "void *" to FFI object convertion function. */
+		lua_pushlightuserdata(L, obj);
+		lua_call(L, 1, 1);
+		return obj;
+	}
+#endif
+	/* create new userdata. */
+	ud = lua_newuserdata(L, size);
+	memcpy(ud, obj, size);
+	/* get obj_type metatable. */
+#if LUAJIT_FFI
+	lua_insert(L, -2); /* move userdata below metatable. */
+#else
+	lua_pushlightuserdata(L, type);
+	lua_rawget(L, LUA_REGISTRYINDEX); /* type's metatable. */
+#endif
 	lua_setmetatable(L, -2);
 
 	return ud;
@@ -687,7 +770,7 @@ static int obj_constructor_call_wrapper(lua_State *L) {
 }
 
 static void obj_type_register_constants(lua_State *L, const obj_const *constants, int tab_idx,
-		bool bidirectional) {
+		int bidirectional) {
 	/* register constants. */
 	while(constants->name != NULL) {
 		lua_pushstring(L, constants->name);
@@ -853,6 +936,12 @@ static void obj_type_register(lua_State *L, const reg_sub_module *type_reg, int 
 	lua_pop(L, 2);                      /* drop metatable & methods */
 }
 
+static FUNC_UNUSED int lua_checktype_ref(lua_State *L, int _index, int _type) {
+	luaL_checktype(L,_index,_type);
+	lua_pushvalue(L,_index);
+	return luaL_ref(L, LUA_REGISTRYINDEX);
+}
+
 
 
 #define obj_type_Epoller_check(L, _index) \
@@ -867,7 +956,7 @@ static void obj_type_register(lua_State *L, const reg_sub_module *type_reg, int 
 
 
 
-static const char epoll_ffi_lua_code[] = "local ffi=require\"ffi\"\n"
+static const char *epoll_ffi_lua_code[] = { "local ffi=require\"ffi\"\n"
 "local function ffi_safe_load(name, global)\n"
 "	local stat, C = pcall(ffi.load, name, global)\n"
 "	if not stat then return nil, C end\n"
@@ -878,14 +967,31 @@ static const char epoll_ffi_lua_code[] = "local ffi=require\"ffi\"\n"
 "	return assert(ffi_safe_load(name, global))\n"
 "end\n"
 "\n"
+"local function ffi_string(ptr)\n"
+"	if ptr ~= nil then\n"
+"		return ffi.string(ptr)\n"
+"	end\n"
+"	return nil\n"
+"end\n"
+"\n"
+"local function ffi_string_len(ptr, len)\n"
+"	if ptr ~= nil then\n"
+"		return ffi.string(ptr, len)\n"
+"	end\n"
+"	return nil\n"
+"end\n"
+"\n"
 "local error = error\n"
 "local type = type\n"
 "local tonumber = tonumber\n"
 "local tostring = tostring\n"
+"local sformat = require\"string\".format\n"
 "local rawset = rawset\n"
 "local setmetatable = setmetatable\n"
+"local package = (require\"package\") or {}\n"
 "local p_config = package.config\n"
 "local p_cpath = package.cpath\n"
+"\n"
 "\n"
 "local ffi_load_cmodule\n"
 "\n"
@@ -893,8 +999,8 @@ static const char epoll_ffi_lua_code[] = "local ffi=require\"ffi\"\n"
 "if p_config == nil and p_cpath == nil then\n"
 "	ffi_load_cmodule = function(name, global)\n"
 "		for path,module in pairs(package.loaded) do\n"
-"			if type(module) == 'string' and path:match(\"zmq\") then\n"
-"				local C, err = ffi_safe_load(path .. '.luvit', global)\n"
+"			if module == name then\n"
+"				local C, err = ffi_safe_load(path, global)\n"
 "				-- return opened library\n"
 "				if C then return C end\n"
 "			end\n"
@@ -920,7 +1026,10 @@ static const char epoll_ffi_lua_code[] = "local ffi=require\"ffi\"\n"
 "	end\n"
 "end\n"
 "\n"
-"local _M, _priv, udata_new = ...\n"
+"local _M, _priv, reg_table = ...\n"
+"local REG_MODULES_AS_GLOBALS = false\n"
+"local REG_OBJECTS_AS_GLOBALS = false\n"
+"local C = ffi.C\n"
 "\n"
 "local OBJ_UDATA_FLAG_OWN		= 1\n"
 "\n"
@@ -964,6 +1073,10 @@ static const char epoll_ffi_lua_code[] = "local ffi=require\"ffi\"\n"
 "\n"
 "]])\n"
 "\n"
+"local nobj_callback_states = {}\n"
+"local nobj_weak_objects = setmetatable({}, {__mode = \"v\"})\n"
+"local nobj_obj_flags = {}\n"
+"\n"
 "local function obj_ptr_to_id(ptr)\n"
 "	return tonumber(ffi.cast('uintptr_t', ptr))\n"
 "end\n"
@@ -991,8 +1104,12 @@ static const char epoll_ffi_lua_code[] = "local ffi=require\"ffi\"\n"
 "	end\n"
 "	_pub[obj_name] = obj_pub\n"
 "	_M[obj_name] = obj_pub\n"
+"	if REG_OBJECTS_AS_GLOBALS then\n"
+"		_G[obj_name] = obj_pub\n"
+"	end\n"
 "end\n"
-"local C = ffi_load_cmodule(\"epoll\", false)\n"
+"local Cmod = ffi_load_cmodule(\"epoll\", false)\n"
+"local C = Cmod\n"
 "\n"
 "ffi.cdef[[\n"
 "typedef int errno_rc;\n"
@@ -1037,19 +1154,25 @@ static const char epoll_ffi_lua_code[] = "local ffi=require\"ffi\"\n"
 "\n"
 "errno_rc epoller_wait(Epoller *, int);\n"
 "\n"
-"typedef Epoller * (*epoller_create_func)(int size);\n"
-"\n"
 "\n"
 "]]\n"
 "\n"
+"REG_MODULES_AS_GLOBALS = false\n"
+"REG_OBJECTS_AS_GLOBALS = false\n"
 "local _pub = {}\n"
 "local _meth = {}\n"
+"local _push = {}\n"
+"local _obj_subs = {}\n"
+"local _type_names = {}\n"
+"local _ctypes = {}\n"
 "for obj_name,mt in pairs(_priv) do\n"
-"	if type(mt) == 'table' and mt.__index then\n"
-"		_meth[obj_name] = mt.__index\n"
+"	if type(mt) == 'table' then\n"
+"		_obj_subs[obj_name] = {}\n"
+"		if mt.__index then\n"
+"			_meth[obj_name] = mt.__index\n"
+"		end\n"
 "	end\n"
 "end\n"
-"_pub.epoll = _M\n"
 "for obj_name,pub in pairs(_M) do\n"
 "	_pub[obj_name] = pub\n"
 "end\n"
@@ -1061,50 +1184,62 @@ static const char epoll_ffi_lua_code[] = "local ffi=require\"ffi\"\n"
 "\n"
 "do\n"
 "	local obj_mt = _priv.Epoller\n"
-"	local objects = setmetatable({}, {__mode = \"v\"})\n"
-"	local obj_flags = {}\n"
-"\n"
 "	local obj_type = obj_mt['.type']\n"
-"	_priv[obj_type] = function(ptr)\n"
-"		if ffi.istype(\"Epoller *\", ptr) then return ptr end\n"
-"		return nil\n"
-"	end\n"
+"	local obj_ctype = ffi.typeof(\"Epoller *\")\n"
+"	_ctypes.Epoller = obj_ctype\n"
+"	_type_names.Epoller = tostring(obj_ctype)\n"
 "\n"
 "	function obj_type_Epoller_check(ptr)\n"
-"		return ptr\n"
+"		-- if ptr is nil or is the correct type, then just return it.\n"
+"		if not ptr or ffi.istype(obj_ctype, ptr) then return ptr end\n"
+"		-- check if it is a compatible type.\n"
+"		local ctype = tostring(ffi.typeof(ptr))\n"
+"		local bcaster = _obj_subs.Epoller[ctype]\n"
+"		if bcaster then\n"
+"			return bcaster(ptr)\n"
+"		end\n"
+"		return error(\"Expected 'Epoller *'\", 2)\n"
 "	end\n"
 "\n"
 "	function obj_type_Epoller_delete(ptr)\n"
 "		local id = obj_ptr_to_id(ptr)\n"
-"		local flags = obj_flags[id]\n"
+"		local flags = nobj_obj_flags[id]\n"
 "		if not flags then return nil, 0 end\n"
 "		ffi.gc(ptr, nil)\n"
-"		obj_flags[id] = nil\n"
+"		nobj_obj_flags[id] = nil\n"
 "		return ptr, flags\n"
 "	end\n"
 "\n"
 "	function obj_type_Epoller_push(ptr, flags)\n"
 "		local id = obj_ptr_to_id(ptr)\n"
 "		-- check weak refs\n"
-"		local old_ptr = objects[id]\n"
+"		local old_ptr = nobj_weak_objects[id]\n"
 "		if old_ptr then return old_ptr end\n"
-"		if flags then\n"
-"			obj_flags[id] = flags\n"
+"\n"
+"		if flags ~= 0 then\n"
+"			nobj_obj_flags[id] = flags\n"
 "			ffi.gc(ptr, obj_mt.__gc)\n"
 "		end\n"
-"		objects[id] = ptr\n"
+"		nobj_weak_objects[id] = ptr\n"
 "		return ptr\n"
 "	end\n"
 "\n"
 "	function obj_mt:__tostring()\n"
-"		local id = obj_ptr_to_id(self)\n"
-"		return \"Epoller: \" .. tostring(id)\n"
+"		return sformat(\"Epoller: %p, flags=%d\", self, nobj_obj_flags[obj_ptr_to_id(self)] or 0)\n"
+"	end\n"
+"\n"
+"	-- type checking function for C API.\n"
+"	_priv[obj_type] = function(ptr)\n"
+"		if ffi.istype(obj_ctype, ptr) then return ptr end\n"
+"		return nil\n"
+"	end\n"
+"	-- push function for C API.\n"
+"	reg_table[obj_type] = function(ptr, flags)\n"
+"		return obj_type_Epoller_push(ffi.cast(obj_ctype,ptr), flags)\n"
 "	end\n"
 "\n"
 "end\n"
 "\n"
-"\n"
-"local epoller_create = ffi.new(\"epoller_create_func\", _priv[\"epoller_create\"])\n"
 "\n"
 "\n"
 "-- Start \"Errors\" FFI interface\n"
@@ -1133,13 +1268,16 @@ static const char epoll_ffi_lua_code[] = "local ffi=require\"ffi\"\n"
 "  return obj_type_Epoller_push(self, this_flags)\n"
 "end\n"
 "register_default_constructor(_pub,\"Epoller\",_pub.Epoller.new)\n"
-"-- method: __gc\n"
-"function _priv.Epoller.__gc(self)\n"
+"\n"
+"-- method: close\n"
+"function _meth.Epoller.close(self)\n"
 "  local self,this_flags = obj_type_Epoller_delete(self)\n"
 "  if not self then return end\n"
 "  C.epoller_destroy(self)\n"
 "  return \n"
 "end\n"
+"_priv.Epoller.__gc = _meth.Epoller.close\n"
+"\n"
 "-- method: add\n"
 "function _meth.Epoller.add(self, fd, events, id)\n"
 "  \n"
@@ -1154,6 +1292,7 @@ static const char epoll_ffi_lua_code[] = "local ffi=require\"ffi\"\n"
 "  end\n"
 "  return true\n"
 "end\n"
+"\n"
 "-- method: mod\n"
 "function _meth.Epoller.mod(self, fd, events, id)\n"
 "  \n"
@@ -1168,6 +1307,7 @@ static const char epoll_ffi_lua_code[] = "local ffi=require\"ffi\"\n"
 "  end\n"
 "  return true\n"
 "end\n"
+"\n"
 "-- method: del\n"
 "function _meth.Epoller.del(self, fd)\n"
 "  \n"
@@ -1180,6 +1320,7 @@ static const char epoll_ffi_lua_code[] = "local ffi=require\"ffi\"\n"
 "  end\n"
 "  return true\n"
 "end\n"
+"\n"
 "-- method: wait\n"
 "function _meth.Epoller.wait(self, events, timeout)\n"
 "  \n"
@@ -1203,6 +1344,7 @@ static const char epoll_ffi_lua_code[] = "local ffi=require\"ffi\"\n"
 "  end\n"
 "  return true\n"
 "end\n"
+"\n"
 "-- method: wait_callback\n"
 "function _meth.Epoller.wait_callback(self, event_cb, timeout)\n"
 "  \n"
@@ -1222,18 +1364,20 @@ static const char epoll_ffi_lua_code[] = "local ffi=require\"ffi\"\n"
 "  end\n"
 "  return true\n"
 "end\n"
+"\n"
+"_push.Epoller = obj_type_Epoller_push\n"
 "ffi.metatype(\"Epoller\", _priv.Epoller)\n"
 "-- End \"Epoller\" FFI interface\n"
 "\n"
 "-- method: new\n"
-"function _pub.epoll.new(size)\n"
+"function _M.new(size)\n"
 "    size = size or 64\n"
 "  local this_flags = OBJ_UDATA_FLAG_OWN\n"
 "  local this\n"
-"  this = epoller_create(size)\n"
+"  this = Cmod.epoller_create(size)\n"
 "  return obj_type_Epoller_push(this, this_flags)\n"
 "end\n"
-"";
+"\n", NULL };
 static char epoll_Errors_key[] = "epoll_Errors_key";
 
 typedef struct Epoller {
@@ -1375,8 +1519,8 @@ static int Epoller__new__meth(lua_State *L) {
   return 1;
 }
 
-/* method: _priv */
-static int Epoller__delete__meth(lua_State *L) {
+/* method: close */
+static int Epoller__close__meth(lua_State *L) {
   int this_flags = 0;
   Epoller * this = obj_type_Epoller_delete(L,1,&(this_flags));
   if(!(this_flags & OBJ_UDATA_FLAG_OWN)) { return 0; }
@@ -1931,6 +2075,7 @@ static const luaL_reg obj_Epoller_pub_funcs[] = {
 };
 
 static const luaL_reg obj_Epoller_methods[] = {
+  {"close", Epoller__close__meth},
   {"add", Epoller__add__meth},
   {"mod", Epoller__mod__meth},
   {"del", Epoller__del__meth},
@@ -1940,7 +2085,7 @@ static const luaL_reg obj_Epoller_methods[] = {
 };
 
 static const luaL_reg obj_Epoller_metas[] = {
-  {"__gc", Epoller__delete__meth},
+  {"__gc", Epoller__close__meth},
   {"__tostring", obj_udata_default_tostring},
   {"__eq", obj_udata_default_equal},
   {NULL, NULL}
@@ -1991,9 +2136,9 @@ static const obj_const epoll_constants[] = {
 
 
 static const reg_sub_module reg_sub_modules[] = {
-  { &(obj_type_Errors), REG_META, obj_Errors_pub_funcs, obj_Errors_methods, obj_Errors_metas, NULL, NULL, obj_Errors_constants, true},
-  { &(obj_type_Epoller), REG_OBJECT, obj_Epoller_pub_funcs, obj_Epoller_methods, obj_Epoller_metas, obj_Epoller_bases, obj_Epoller_fields, obj_Epoller_constants, false},
-  {NULL, 0, NULL, NULL, NULL, NULL, NULL, NULL, false}
+  { &(obj_type_Errors), REG_META, obj_Errors_pub_funcs, obj_Errors_methods, obj_Errors_metas, NULL, NULL, obj_Errors_constants, 1},
+  { &(obj_type_Epoller), REG_OBJECT, obj_Epoller_pub_funcs, obj_Epoller_methods, obj_Epoller_metas, obj_Epoller_bases, obj_Epoller_fields, obj_Epoller_constants, 0},
+  {NULL, 0, NULL, NULL, NULL, NULL, NULL, NULL, 0}
 };
 
 
@@ -2002,8 +2147,7 @@ static const reg_sub_module reg_sub_modules[] = {
 
 #if LUAJIT_FFI
 static const ffi_export_symbol epoll_ffi_export[] = {
-{ "epoller_create", epoller_create },
-  {NULL, NULL}
+  {NULL, { NULL } }
 };
 #endif
 
@@ -2051,11 +2195,15 @@ LUA_NOBJ_API int luaopen_epoll(lua_State *L) {
 	create_object_instance_cache(L);
 
 	/* module table. */
+#if REG_MODULES_AS_GLOBALS
+	luaL_register(L, "epoll", epoll_function);
+#else
 	lua_newtable(L);
 	luaL_register(L, NULL, epoll_function);
+#endif
 
 	/* register module constants. */
-	obj_type_register_constants(L, epoll_constants, -1, false);
+	obj_type_register_constants(L, epoll_constants, -1, 0);
 
 	for(; submodules->func != NULL ; submodules++) {
 		lua_pushcfunction(L, submodules->func);
