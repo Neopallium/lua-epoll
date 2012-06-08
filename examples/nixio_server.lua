@@ -1,98 +1,71 @@
 
-local epoll = require"epoll"
+local epoller = require"epoller"
 local nixio = require"nixio"
 
-local epoller = epoll.new()
+local poller = epoller.new()
 
-local socks = {}
-local cbs = {}
+local wsock_meth = {}
+local wsock_mt = { __index = wsock_meth }
 
-local function poll_add(sock, events, cb)
+function wsock_meth:fileno()
+	return self.sock:fileno()
+end
+
+function wsock_meth:close()
+	local sock = self.sock
+	if not sock then return end
 	local fd = sock:fileno()
-	cbs[fd] = cb
-	return epoller:add(fd, events, fd)
+	poller:del(self)
+	self.sock = nil
+	sock:close()
 end
 
-local function poll_mod(sock, events, cb)
-	local fd = sock:fileno()
-	cbs[fd] = cb
-	return epoller:mod(fd, events, fd)
+local function wrap_sock(sock, on_io_event)
+	return setmetatable({ sock = sock, on_io_event = on_io_event }, wsock_mt)
 end
 
-local function poll_del(sock)
-	local fd = sock:fileno()
-	cbs[fd] = nil
-	return epoller:del(fd)
-end
-
-local function poll_loop()
-	local events = {}
-	while true do
-		assert(epoller:wait(events, -1))
-		for i=1,#events,2 do
-			local fd = events[i]
-			local ev = events[i+1]
-			-- remove event from table.
-			events[i] = nil
-			events[i+1] = nil
-			-- call registered callback.
-			local sock = socks[fd]
-			local cb = cbs[fd]
-			if sock and cb then
-				cb(sock, ev)
-			end
-		end
-	end
-end
-
-local function accept_connection(sock, cb)
-	local client = sock:accept()
+local function accept_connection(server, cb)
+	local client = server:accept()
 	local fd = client:fileno()
-	socks[fd] = client
 	client:setblocking(false)
+	client = wrap_sock(client, cb)
 	-- register callback for read events.
-	poll_add(client, epoll.EPOLLIN, cb)
+	poller:add(client, epoller.EPOLLIN)
 	return client
 end
 
 local function new_acceptor(host, port, family, cb)
 	local sock = nixio.socket(family or 'inet', 'stream')
 	local fd = sock:fileno()
-	socks[fd] = sock
 	sock:setblocking(false)
 	assert(sock:setsockopt('socket', 'reuseaddr', 1))
 	if host == '*' then host = nil end
 	assert(sock:bind(host, port))
 	assert(sock:listen(1024))
 	-- register callback for read events.
-	poll_add(sock, epoll.EPOLLIN, cb)
+	sock = wrap_sock(sock, cb)
+	poller:add(sock, epoller.EPOLLIN)
 	return sock
 end
 
-local function sock_close(sock)
-	local fd = sock:fileno()
-	socks[fd] = nil
-	poll_del(sock)
-	sock:close()
-end
-
 local function new_client(server)
-	accept_connection(server, function(sock, events)
+	accept_connection(server, function(wsock, events)
+		local sock = wsock.sock
 		local msg = sock:recv(1024)
 		if msg and #msg > 0 then
 			sock:send("echo:" .. msg)
 		else
 			print('closing client')
-			sock_close(sock)
+			wsock:close()
 		end
 	end)
 end
 
 local function new_server(port)
 	print("listen on:", port)
-	new_acceptor('*', port, 'inet', function(sock, events)
+	new_acceptor('*', port, 'inet', function(wsock, events)
 		print("accept new client on:", port)
-		new_client(sock)
+		new_client(wsock.sock)
 	end)
 end
 
@@ -104,5 +77,5 @@ if #arg == 0 then
 	new_server("1080")
 end
 
-poll_loop()
+poller:start()
 
