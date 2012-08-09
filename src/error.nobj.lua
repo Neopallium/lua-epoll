@@ -164,7 +164,7 @@ meta_object "Errors" {
 
 	method "description" {
 		var_in{ "<any>", "err" },
-		var_out{ "const char *", "msg" },
+		var_out{ "char *", "msg", need_buffer = 1024 },
 		c_source "pre" [[
 	int err_type;
 	int err_num = -1;
@@ -188,7 +188,8 @@ meta_object "Errors" {
 		lua_pushliteral(L, "UNKNOWN ERROR");
 		return 2;
 	}
-	${msg} = strerror(err_num);
+	strerror_r(err_num, ${msg}, ${msg_len});
+	${msg_len} = strlen(${msg});
 ]],
 	},
 }
@@ -215,6 +216,7 @@ c_source "module_init_src" [[
 ]]
 
 error_code "errno_rc" "int" {
+	sys_include"string.h",
 	ffi_type = "int",
 	is_error_check = function(rec) return "(-1 == ${" .. rec.name .. "})" end,
 	ffi_is_error_check = function(rec) return "(-1 == ${" .. rec.name .. "})" end,
