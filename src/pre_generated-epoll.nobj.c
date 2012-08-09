@@ -182,6 +182,11 @@ typedef enum {
 	REG_META,
 } module_reg_type;
 
+typedef struct reg_impl {
+	const char *if_name;
+	const void *impl;
+} reg_impl;
+
 typedef struct reg_sub_module {
 	obj_type        *type;
 	module_reg_type req_type;
@@ -191,6 +196,7 @@ typedef struct reg_sub_module {
 	const obj_base  *bases;
 	const obj_field *fields;
 	const obj_const *constants;
+	const reg_impl  *implements;
 	int             bidirectional_consts;
 } reg_sub_module;
 
@@ -303,6 +309,7 @@ static const char *nobj_lua_Reader(lua_State *L, void *data, size_t *size) {
 	nobj_reader_state *state = (nobj_reader_state *)data;
 	const char *ptr;
 
+	(void)L;
 	ptr = state->ffi_init_code[state->offset];
 	if(ptr != NULL) {
 		*size = strlen(ptr);
@@ -345,6 +352,183 @@ static int nobj_try_loading_ffi(lua_State *L, const char *ffi_mod_name,
 	return err;
 }
 #endif
+
+
+typedef struct {
+	void *impl;
+	void *obj;
+} obj_implement;
+
+static FUNC_UNUSED void *obj_implement_luaoptional(lua_State *L, int _index, void **impl, char *if_name) {
+	void *ud;
+	if(lua_isnoneornil(L, _index)) {
+		return NULL;
+	}
+	/* get the implements table for this interface. */
+	lua_pushlightuserdata(L, if_name);
+	lua_rawget(L, LUA_REGISTRYINDEX);
+
+	/* get pointer to userdata value & check if it is a userdata value. */
+	ud = (obj_implement *)lua_touserdata(L, _index);
+	if(ud != NULL) {
+		/* get the userdata's metatable */
+		if(lua_getmetatable(L, _index)) {
+			/* lookup metatable in interface table for this object's implementation of the interface. */
+			lua_gettable(L, -2);
+		} else {
+			/* no metatable. */
+			goto no_interface;
+		}
+#if LUAJIT_FFI
+	} else if(nobj_ffi_support_enabled_hint) { /* handle cdata. */
+		/* get cdata interface check function from interface table. */
+		lua_getfield(L, -1, "cdata");
+		if(lua_isfunction(L, -1)) {
+			/* pass cdata to function, return value should be an implmentation. */
+			lua_pushvalue(L, _index);
+			lua_call(L, 1, 1);
+			/* get pointer to cdata. */
+			ud = (void *)lua_topointer(L, _index);
+		} else {
+			lua_pop(L, 1); /* pop non-function. */
+			goto no_interface;
+		}
+#endif
+	} else {
+		goto no_interface;
+	}
+
+	if(!lua_isnil(L, -1)) {
+		*impl = lua_touserdata(L, -1);
+		lua_pop(L, 2); /* pop interface table & implementation. */
+		/* object implements interface. */
+		return ud;
+	} else {
+		lua_pop(L, 1); /* pop nil. */
+	}
+no_interface:
+	lua_pop(L, 1); /* pop interface table. */
+	return NULL;
+}
+
+static FUNC_UNUSED void *obj_implement_luacheck(lua_State *L, int _index, void **impl, char *type) {
+	void *ud = obj_implement_luaoptional(L, _index, impl, type);
+	if(ud == NULL) {
+#define ERROR_BUFFER_SIZE 256
+		char buf[ERROR_BUFFER_SIZE];
+		snprintf(buf, ERROR_BUFFER_SIZE-1,"Expected object with %s interface", type);
+		/* value doesn't implement this interface. */
+		luaL_argerror(L, _index, buf);
+	}
+	return ud;
+}
+
+/* use static pointer as key to interfaces table. (version 1.0) */
+static char obj_interfaces_table_key[] = "obj_interfaces<1.0>_table_key";
+
+static void obj_get_global_interfaces_table(lua_State *L) {
+	/* get global interfaces table. */
+	lua_getfield(L, LUA_REGISTRYINDEX, obj_interfaces_table_key);
+	if(lua_isnil(L, -1)) {
+		/* Need to create global interfaces table. */
+		lua_pop(L, 1); /* pop nil */
+		lua_createtable(L, 0, 4); /* 0 size array part, small hash part. */
+		lua_pushvalue(L, -1); /* dup table. */
+		/* store interfaces table in Lua registery. */
+		lua_setfield(L, LUA_REGISTRYINDEX, obj_interfaces_table_key);
+	}
+}
+
+static void obj_get_interface(lua_State *L, const char *name, int global_if_tab) {
+	/* get a interface's implementation table */
+	lua_getfield(L, global_if_tab, name);
+	if(lua_isnil(L, -1)) {
+		lua_pop(L, 1); /* pop nil */
+		/* new interface. (i.e. no object implement it yet.)
+		 *
+		 * create an empty table for this interface that will be used when an
+		 * implementation is registered for this interface.
+		 */
+		lua_createtable(L, 0, 2); /* 0 size array part, small hash part. */
+		lua_pushvalue(L, -1); /* dup table. */
+		lua_setfield(L, global_if_tab, name); /* store interface in global interfaces table. */
+	}
+}
+
+static int obj_get_userdata_interface(lua_State *L) {
+	/* get the userdata's metatable */
+	if(lua_getmetatable(L, 2)) {
+		/* lookup metatable in interface table for the userdata's implementation of the interface. */
+		lua_gettable(L, 1);
+		if(!lua_isnil(L, -1)) {
+			/* return the implementation. */
+			return 1;
+		}
+	}
+	/* no metatable or no implementation. */
+	return 0;
+}
+
+static void obj_interface_register(lua_State *L, char *name, int global_if_tab) {
+	/* get the table of implementations for this interface. */
+	obj_get_interface(L, name, global_if_tab);
+
+	/* check for 'userdata' function. */
+	lua_getfield(L, -1, "userdata");
+	if(lua_isnil(L, -1)) {
+		lua_pop(L, 1); /* pop nil. */
+		/* add C function for getting a userdata's implementation. */
+		lua_pushcfunction(L, obj_get_userdata_interface);
+		lua_setfield(L, -2, "userdata");
+	} else {
+		/* already have function. */
+		lua_pop(L, 1); /* pop C function. */
+	}
+	/* we are going to use a lightuserdata pointer for fast lookup of the interface's impl. table. */
+	lua_pushlightuserdata(L, name);
+	lua_insert(L, -2);
+	lua_settable(L, LUA_REGISTRYINDEX);
+}
+
+static void obj_register_interfaces(lua_State *L, char *interfaces[]) {
+	int i;
+	int if_tab;
+	/* get global interfaces table. */
+	obj_get_global_interfaces_table(L);
+	if_tab = lua_gettop(L);
+
+	for(i = 0; interfaces[i] != NULL ; i++) {
+		obj_interface_register(L, interfaces[i], if_tab);
+	}
+	lua_pop(L, 1); /* pop global interfaces table. */
+}
+
+static void obj_type_register_implement(lua_State *L, const reg_impl *impl, int global_if_tab, int mt_tab) {
+	/* get the table of implementations for this interface. */
+	obj_get_interface(L, impl->if_name, global_if_tab);
+
+	/* register object's implement in the interface table. */
+	lua_pushvalue(L, mt_tab);
+	lua_pushlightuserdata(L, (void *)impl->impl);
+	lua_settable(L, -3);
+
+	lua_pop(L, 1); /* pop inteface table. */
+}
+
+static void obj_type_register_implements(lua_State *L, const reg_impl *impls) {
+	int if_tab;
+	int mt_tab;
+	/* get absolute position of object's metatable. */
+	mt_tab = lua_gettop(L);
+	/* get global interfaces table. */
+	obj_get_global_interfaces_table(L);
+	if_tab = lua_gettop(L);
+
+	for(; impls->if_name != NULL ; impls++) {
+		obj_type_register_implement(L, impls, if_tab, mt_tab);
+	}
+	lua_pop(L, 1); /* pop global interfaces table. */
+}
 
 #ifndef REG_PACKAGE_IS_CONSTRUCTOR
 #define REG_PACKAGE_IS_CONSTRUCTOR 1
@@ -441,7 +625,7 @@ static FUNC_UNUSED obj_udata *obj_udata_luacheck_internal(lua_State *L, int _ind
 				return ud;
 			}
 		}
-	} else {
+	} else if(!lua_isnoneornil(L, _index)) {
 		/* handle cdata. */
 		/* get private table. */
 		lua_pushlightuserdata(L, obj_udata_private_key);
@@ -450,16 +634,21 @@ static FUNC_UNUSED obj_udata *obj_udata_luacheck_internal(lua_State *L, int _ind
 		lua_pushlightuserdata(L, type);
 		lua_rawget(L, -2);
 
-		/* pass cdata value to type checking function. */
-		lua_pushvalue(L, _index);
-		lua_call(L, 1, 1);
+		/* check for function. */
 		if(!lua_isnil(L, -1)) {
-			/* valid type get pointer from cdata. */
+			/* pass cdata value to type checking function. */
+			lua_pushvalue(L, _index);
+			lua_call(L, 1, 1);
+			if(!lua_isnil(L, -1)) {
+				/* valid type get pointer from cdata. */
+				lua_pop(L, 2);
+				*obj = *(void **)lua_topointer(L, _index);
+				return ud;
+			}
 			lua_pop(L, 2);
-			*obj = *(void **)lua_topointer(L, _index);
-			return ud;
+		} else {
+			lua_pop(L, 1);
 		}
-		lua_pop(L, 2);
 	}
 	if(not_delete) {
 		luaL_typerror(L, _index, type->name); /* is not a userdata value. */
@@ -475,7 +664,7 @@ static FUNC_UNUSED void *obj_udata_luacheck(lua_State *L, int _index, obj_type *
 
 static FUNC_UNUSED void *obj_udata_luaoptional(lua_State *L, int _index, obj_type *type) {
 	void *obj = NULL;
-	if(lua_isnil(L, _index)) {
+	if(lua_isnoneornil(L, _index)) {
 		return obj;
 	}
 	obj_udata_luacheck_internal(L, _index, &(obj), type, 1);
@@ -490,6 +679,9 @@ static FUNC_UNUSED void *obj_udata_luadelete(lua_State *L, int _index, obj_type 
 	/* null userdata. */
 	ud->obj = NULL;
 	ud->flags = 0;
+	/* clear the metatable in invalidate userdata. */
+	lua_pushnil(L);
+	lua_setmetatable(L, _index);
 	return obj;
 }
 
@@ -537,6 +729,9 @@ static FUNC_UNUSED void *obj_udata_luadelete_weak(lua_State *L, int _index, obj_
 	/* null userdata. */
 	ud->obj = NULL;
 	ud->flags = 0;
+	/* clear the metatable in invalidate userdata. */
+	lua_pushnil(L);
+	lua_setmetatable(L, _index);
 	/* get objects weak table. */
 	lua_pushlightuserdata(L, obj_udata_weak_ref_key);
 	lua_rawget(L, LUA_REGISTRYINDEX); /* weak ref table. */
@@ -659,7 +854,7 @@ static FUNC_UNUSED void * obj_simple_udata_luacheck(lua_State *L, int _index, ob
 				return ud;
 			}
 		}
-	} else {
+	} else if(!lua_isnoneornil(L, _index)) {
 		/* handle cdata. */
 		/* get private table. */
 		lua_pushlightuserdata(L, obj_udata_private_key);
@@ -668,22 +863,24 @@ static FUNC_UNUSED void * obj_simple_udata_luacheck(lua_State *L, int _index, ob
 		lua_pushlightuserdata(L, type);
 		lua_rawget(L, -2);
 
-		/* pass cdata value to type checking function. */
-		lua_pushvalue(L, _index);
-		lua_call(L, 1, 1);
+		/* check for function. */
 		if(!lua_isnil(L, -1)) {
-			/* valid type get pointer from cdata. */
-			lua_pop(L, 2);
-			return (void *)lua_topointer(L, _index);
+			/* pass cdata value to type checking function. */
+			lua_pushvalue(L, _index);
+			lua_call(L, 1, 1);
+			if(!lua_isnil(L, -1)) {
+				/* valid type get pointer from cdata. */
+				lua_pop(L, 2);
+				return (void *)lua_topointer(L, _index);
+			}
 		}
-		lua_pop(L, 2);
 	}
 	luaL_typerror(L, _index, type->name); /* is not a userdata value. */
 	return NULL;
 }
 
 static FUNC_UNUSED void * obj_simple_udata_luaoptional(lua_State *L, int _index, obj_type *type) {
-	if(lua_isnil(L, _index)) {
+	if(lua_isnoneornil(L, _index)) {
 		return NULL;
 	}
 	return obj_simple_udata_luacheck(L, _index, type);
@@ -924,6 +1121,8 @@ static void obj_type_register(lua_State *L, const reg_sub_module *type_reg, int 
 
 	obj_type_register_constants(L, type_reg->constants, -2, type_reg->bidirectional_consts);
 
+	obj_type_register_implements(L, type_reg->implements);
+
 	lua_pushliteral(L, "__index");
 	lua_pushvalue(L, -3);               /* dup methods table */
 	lua_rawset(L, -3);                  /* metatable.__index = methods */
@@ -941,6 +1140,12 @@ static FUNC_UNUSED int lua_checktype_ref(lua_State *L, int _index, int _type) {
 	lua_pushvalue(L,_index);
 	return luaL_ref(L, LUA_REGISTRYINDEX);
 }
+
+
+
+static char *obj_interfaces[] = {
+  NULL,
+};
 
 
 
@@ -981,6 +1186,8 @@ static const char *epoll_ffi_lua_code[] = { "local ffi=require\"ffi\"\n"
 "	return nil\n"
 "end\n"
 "\n"
+"local f_cast = ffi.cast\n"
+"local pcall = pcall\n"
 "local error = error\n"
 "local type = type\n"
 "local tonumber = tonumber\n"
@@ -1078,11 +1285,11 @@ static const char *epoll_ffi_lua_code[] = { "local ffi=require\"ffi\"\n"
 "local nobj_obj_flags = {}\n"
 "\n"
 "local function obj_ptr_to_id(ptr)\n"
-"	return tonumber(ffi.cast('uintptr_t', ptr))\n"
+"	return tonumber(f_cast('uintptr_t', ptr))\n"
 "end\n"
 "\n"
 "local function obj_to_id(ptr)\n"
-"	return tonumber(ffi.cast('uintptr_t', ffi.cast('void *', ptr)))\n"
+"	return tonumber(f_cast('uintptr_t', f_cast('void *', ptr)))\n"
 "end\n"
 "\n"
 "local function register_default_constructor(_pub, obj_name, constructor)\n"
@@ -1108,6 +1315,21 @@ static const char *epoll_ffi_lua_code[] = { "local ffi=require\"ffi\"\n"
 "		_G[obj_name] = obj_pub\n"
 "	end\n"
 "end\n"
+"\n"
+"ffi_safe_cdef(\"MutableBufferIF\", [[\n"
+"typedef struct MutableBuffer_if {\n"
+"  uint8_t * (* const data)(void *this_v);\n"
+"  size_t (* const get_size)(void *this_v);\n"
+"} MutableBufferIF;\n"
+"]])\n"
+"\n"
+"ffi_safe_cdef(\"BufferIF\", [[\n"
+"typedef struct Buffer_if {\n"
+"  const uint8_t * (* const const_data)(void *this_v);\n"
+"  size_t (* const get_size)(void *this_v);\n"
+"} BufferIF;\n"
+"]])\n"
+"\n"
 "local Cmod = ffi_load_cmodule(\"epoll\", false)\n"
 "local C = Cmod\n"
 "\n"
@@ -1159,12 +1381,11 @@ static const char *epoll_ffi_lua_code[] = { "local ffi=require\"ffi\"\n"
 "\n"
 "REG_MODULES_AS_GLOBALS = false\n"
 "REG_OBJECTS_AS_GLOBALS = false\n"
+"local _obj_interfaces_ffi = {}\n"
 "local _pub = {}\n"
 "local _meth = {}\n"
 "local _push = {}\n"
 "local _obj_subs = {}\n"
-"local _type_names = {}\n"
-"local _ctypes = {}\n"
 "for obj_name,mt in pairs(_priv) do\n"
 "	if type(mt) == 'table' then\n"
 "		_obj_subs[obj_name] = {}\n"
@@ -1177,17 +1398,112 @@ static const char *epoll_ffi_lua_code[] = { "local ffi=require\"ffi\"\n"
 "	_pub[obj_name] = pub\n"
 "end\n"
 "\n"
+"--\n"
+"-- CData Metatable access\n"
+"--\n"
+"local _ctypes = {}\n"
+"local _type_names = {}\n"
+"local _get_mt_key = {}\n"
+"local _ctype_meta_map = {}\n"
+"\n"
+"local f_typeof = ffi.typeof\n"
+"local function get_cdata_type_id(cdata)\n"
+"	return tonumber(f_typeof(cdata))\n"
+"end\n"
+"local function get_cdata_mt(cdata)\n"
+"	return _ctype_meta_map[tonumber(f_typeof(cdata))]\n"
+"end\n"
+"\n"
+"local function obj_register_ctype(name, ctype)\n"
+"	local obj_mt = _priv[name]\n"
+"	local obj_type = obj_mt['.type']\n"
+"	local obj_ctype = ffi.typeof(ctype)\n"
+"	local obj_type_id = tonumber(obj_ctype)\n"
+"	_ctypes[name] = obj_ctype\n"
+"	_type_names[name] = tostring(obj_ctype)\n"
+"	_ctype_meta_map[obj_type_id] = obj_mt\n"
+"	_ctype_meta_map[obj_mt] = obj_type_id\n"
+"	return obj_mt, obj_type, obj_ctype\n"
+"end\n"
+"\n"
+"--\n"
+"-- Interfaces helper code.\n"
+"--\n"
+"local _obj_interfaces_key = \"obj_interfaces<1.0>_table_key\"\n"
+"local _obj_interfaces_ud = reg_table[_obj_interfaces_key]\n"
+"local _obj_interfaces_key_ffi = _obj_interfaces_key .. \"_LJ2_FFI\"\n"
+"_obj_interfaces_ffi = reg_table[_obj_interfaces_key_ffi]\n"
+"if not _obj_interfaces_ffi then\n"
+"	-- create missing interfaces table for FFI bindings.\n"
+"	_obj_interfaces_ffi = {}\n"
+"	reg_table[_obj_interfaces_key_ffi] = _obj_interfaces_ffi\n"
+"end\n"
+"\n"
+"local function obj_get_userdata_interface(if_name, expected_err)\n"
+"	local impls_ud = _obj_interfaces_ud[if_name]\n"
+"	if not impls_ud then\n"
+"		impls_ud = {}\n"
+"		_obj_interfaces_ud[if_name] = impls_ud\n"
+"	end\n"
+"	-- create cdata check function to be used by non-ffi bindings.\n"
+"	if not impls_ud.cdata then\n"
+"		function impls_ud.cdata(obj)\n"
+"			return assert(impls_ud[get_cdata_mt(obj)], expected_err)\n"
+"		end\n"
+"	end\n"
+"	return impls_ud\n"
+"end\n"
+"\n"
+"local function obj_get_interface_check(if_name, expected_err)\n"
+"	local impls_ffi = _obj_interfaces_ffi[if_name]\n"
+"	if not impls_ffi then\n"
+"		local if_type = ffi.typeof(if_name .. \" *\")\n"
+"		local impls_ud = obj_get_userdata_interface(if_name, expected_err)\n"
+"		-- create table for FFI-based interface implementations.\n"
+"		impls_ffi = setmetatable({}, {\n"
+"		__index = function(impls_ffi, mt)\n"
+"			local impl = impls_ud[mt]\n"
+"			if impl then\n"
+"				-- cast to cdata\n"
+"				impl = if_type(impl)\n"
+"				rawset(impls_ffi, mt, impl)\n"
+"			end\n"
+"			return impl\n"
+"		end})\n"
+"		_obj_interfaces_ffi[if_name] = impls_ffi\n"
+"\n"
+"		-- create check function for this interface.\n"
+"		function impls_ffi.check(obj)\n"
+"			local impl\n"
+"			if type(obj) == 'cdata' then\n"
+"				impl = impls_ffi[get_cdata_type_id(obj)]\n"
+"			else\n"
+"				impl = impls_ud.userdata(impls_ffi, obj)\n"
+"			end\n"
+"			return assert(impl, expected_err)\n"
+"		end\n"
+"	end\n"
+"	return impls_ffi.check\n"
+"end\n"
+"\n"
+"local function obj_register_interface(if_name, obj_name)\n"
+"	-- loopkup cdata id\n"
+"	local obj_mt = _priv[obj_name]\n"
+"	local obj_type_id = _ctype_meta_map[obj_mt]\n"
+"	local impl_meths = {}\n"
+"	local ffi_impls = _obj_interfaces_ffi[if_name]\n"
+"	ffi_impls[obj_type_id] = impl_meths\n"
+"	_meth[obj_name]['NOBJ_get_' .. if_name] = impl_meths\n"
+"	return impl_meths\n"
+"end\n"
+"\n"
 "\n"
 "local obj_type_Epoller_check\n"
 "local obj_type_Epoller_delete\n"
 "local obj_type_Epoller_push\n"
 "\n"
 "do\n"
-"	local obj_mt = _priv.Epoller\n"
-"	local obj_type = obj_mt['.type']\n"
-"	local obj_ctype = ffi.typeof(\"Epoller *\")\n"
-"	_ctypes.Epoller = obj_ctype\n"
-"	_type_names.Epoller = tostring(obj_ctype)\n"
+"	local obj_mt, obj_type, obj_ctype = obj_register_ctype(\"Epoller\", \"Epoller *\")\n"
 "\n"
 "	function obj_type_Epoller_check(ptr)\n"
 "		-- if ptr is nil or is the correct type, then just return it.\n"
@@ -1213,8 +1529,7 @@ static const char *epoll_ffi_lua_code[] = { "local ffi=require\"ffi\"\n"
 "	function obj_type_Epoller_push(ptr, flags)\n"
 "		local id = obj_ptr_to_id(ptr)\n"
 "		-- check weak refs\n"
-"		local old_ptr = nobj_weak_objects[id]\n"
-"		if old_ptr then return old_ptr end\n"
+"		if nobj_obj_flags[id] then return nobj_weak_objects[id] end\n"
 "\n"
 "		if flags ~= 0 then\n"
 "			nobj_obj_flags[id] = flags\n"
@@ -1229,10 +1544,7 @@ static const char *epoll_ffi_lua_code[] = { "local ffi=require\"ffi\"\n"
 "	end\n"
 "\n"
 "	-- type checking function for C API.\n"
-"	_priv[obj_type] = function(ptr)\n"
-"		if ffi.istype(obj_ctype, ptr) then return ptr end\n"
-"		return nil\n"
-"	end\n"
+"	_priv[obj_type] = obj_type_Epoller_check\n"
 "	-- push function for C API.\n"
 "	reg_table[obj_type] = function(ptr, flags)\n"
 "		return obj_type_Epoller_push(ffi.cast(obj_ctype,ptr), flags)\n"
@@ -1240,6 +1552,12 @@ static const char *epoll_ffi_lua_code[] = { "local ffi=require\"ffi\"\n"
 "\n"
 "end\n"
 "\n"
+"\n"
+"local obj_type_MutableBuffer_check =\n"
+"	obj_get_interface_check(\"MutableBufferIF\", \"Expected object with MutableBuffer interface\")\n"
+"\n"
+"local obj_type_Buffer_check =\n"
+"	obj_get_interface_check(\"BufferIF\", \"Expected object with Buffer interface\")\n"
 "\n"
 "\n"
 "-- Start \"Errors\" FFI interface\n"
@@ -1261,7 +1579,7 @@ static const char *epoll_ffi_lua_code[] = { "local ffi=require\"ffi\"\n"
 "-- Start \"Epoller\" FFI interface\n"
 "-- method: new\n"
 "function _pub.Epoller.new(size)\n"
-"    size = size or 64\n"
+"  size = size or 64\n"
 "  local this_flags = OBJ_UDATA_FLAG_OWN\n"
 "  local self\n"
 "  self = C.epoller_create(size)\n"
@@ -1356,6 +1674,9 @@ static const char *epoll_ffi_lua_code[] = { "local ffi=require\"ffi\"\n"
 "		for n=0,(rc-1) do\n"
 "			event_cb(tonumber(self.events[n].data.u64), tonumber(self.events[n].events))\n"
 "		end\n"
+"		return rc\n"
+"	elseif (rc == 0) then\n"
+"		return rc\n"
 "	end\n"
 "\n"
 "  -- check for error.\n"
@@ -1371,7 +1692,7 @@ static const char *epoll_ffi_lua_code[] = { "local ffi=require\"ffi\"\n"
 "\n"
 "-- method: new\n"
 "function _M.new(size)\n"
-"    size = size or 64\n"
+"  size = size or 64\n"
 "  local this_flags = OBJ_UDATA_FLAG_OWN\n"
 "  local this\n"
 "  this = Cmod.epoller_create(size)\n"
@@ -1455,7 +1776,9 @@ int epoller_wait(Epoller *this, int timeout) {
 
 /* method: description */
 static int Errors__description__meth(lua_State *L) {
-  const char * msg = NULL;
+  size_t msg_len = 1023;
+  char msg_buf[1024];
+  char * msg = msg_buf;
 	int err_type;
 	int err_num = -1;
 
@@ -1477,9 +1800,10 @@ static int Errors__description__meth(lua_State *L) {
 		lua_pushliteral(L, "UNKNOWN ERROR");
 		return 2;
 	}
-	msg = strerror(err_num);
+	strerror_r(err_num, msg, msg_len);
+	msg_len = strlen(msg);
 
-  lua_pushstring(L, msg);
+  if(msg == NULL) lua_pushnil(L);  else lua_pushlstring(L, msg,msg_len);
   return 1;
 }
 
@@ -1511,9 +1835,10 @@ static void error_code__errno_rc__push(lua_State *L, errno_rc err) {
 
 /* method: new */
 static int Epoller__new__meth(lua_State *L) {
-  int size = luaL_optinteger(L,1,64);
+  int size;
   int this_flags = OBJ_UDATA_FLAG_OWN;
   Epoller * this;
+  size = luaL_optinteger(L,1,64);
   this = epoller_create(size);
   obj_type_Epoller_push(L, this, this_flags);
   return 1;
@@ -1522,7 +1847,8 @@ static int Epoller__new__meth(lua_State *L) {
 /* method: close */
 static int Epoller__close__meth(lua_State *L) {
   int this_flags = 0;
-  Epoller * this = obj_type_Epoller_delete(L,1,&(this_flags));
+  Epoller * this;
+  this = obj_type_Epoller_delete(L,1,&(this_flags));
   if(!(this_flags & OBJ_UDATA_FLAG_OWN)) { return 0; }
   epoller_destroy(this);
   return 0;
@@ -1530,11 +1856,15 @@ static int Epoller__close__meth(lua_State *L) {
 
 /* method: add */
 static int Epoller__add__meth(lua_State *L) {
-  Epoller * this = obj_type_Epoller_check(L,1);
-  int fd = luaL_checkinteger(L,2);
-  uint32_t events = luaL_checkinteger(L,3);
-  uint64_t id = luaL_checkinteger(L,4);
+  Epoller * this;
+  int fd;
+  uint32_t events;
+  uint64_t id;
   errno_rc rc_epoller_add = 0;
+  this = obj_type_Epoller_check(L,1);
+  fd = luaL_checkinteger(L,2);
+  events = luaL_checkinteger(L,3);
+  id = luaL_checkinteger(L,4);
   rc_epoller_add = epoller_add(this, fd, events, id);
   /* check for error. */
   if((-1 == rc_epoller_add)) {
@@ -1549,11 +1879,15 @@ static int Epoller__add__meth(lua_State *L) {
 
 /* method: mod */
 static int Epoller__mod__meth(lua_State *L) {
-  Epoller * this = obj_type_Epoller_check(L,1);
-  int fd = luaL_checkinteger(L,2);
-  uint32_t events = luaL_checkinteger(L,3);
-  uint64_t id = luaL_checkinteger(L,4);
+  Epoller * this;
+  int fd;
+  uint32_t events;
+  uint64_t id;
   errno_rc rc_epoller_mod = 0;
+  this = obj_type_Epoller_check(L,1);
+  fd = luaL_checkinteger(L,2);
+  events = luaL_checkinteger(L,3);
+  id = luaL_checkinteger(L,4);
   rc_epoller_mod = epoller_mod(this, fd, events, id);
   /* check for error. */
   if((-1 == rc_epoller_mod)) {
@@ -1568,9 +1902,11 @@ static int Epoller__mod__meth(lua_State *L) {
 
 /* method: del */
 static int Epoller__del__meth(lua_State *L) {
-  Epoller * this = obj_type_Epoller_check(L,1);
-  int fd = luaL_checkinteger(L,2);
+  Epoller * this;
+  int fd;
   errno_rc rc_epoller_del = 0;
+  this = obj_type_Epoller_check(L,1);
+  fd = luaL_checkinteger(L,2);
   rc_epoller_del = epoller_del(this, fd);
   /* check for error. */
   if((-1 == rc_epoller_del)) {
@@ -1585,9 +1921,11 @@ static int Epoller__del__meth(lua_State *L) {
 
 /* method: wait */
 static int Epoller__wait__meth(lua_State *L) {
-  Epoller * this = obj_type_Epoller_check(L,1);
-  int timeout = luaL_checkinteger(L,3);
+  Epoller * this;
+  int timeout;
   errno_rc rc = 0;
+  this = obj_type_Epoller_check(L,1);
+  timeout = luaL_checkinteger(L,3);
 	luaL_checktype(L, 2, LUA_TTABLE);
 
   rc = epoller_wait(this, timeout);
@@ -1616,9 +1954,11 @@ static int Epoller__wait__meth(lua_State *L) {
 
 /* method: wait_callback */
 static int Epoller__wait_callback__meth(lua_State *L) {
-  Epoller * this = obj_type_Epoller_check(L,1);
-  int timeout = luaL_checkinteger(L,3);
+  Epoller * this;
+  int timeout;
   errno_rc rc = 0;
+  this = obj_type_Epoller_check(L,1);
+  timeout = luaL_checkinteger(L,3);
 	luaL_checktype(L, 2, LUA_TFUNCTION);
 
   rc = epoller_wait(this, timeout);
@@ -1631,6 +1971,11 @@ static int Epoller__wait_callback__meth(lua_State *L) {
 			lua_pushinteger(L, this->events[n].events);
 			lua_call(L, 2, 0);
 		}
+		lua_pushinteger(L, rc);
+		return 1;
+	} else if(rc == 0) {
+		lua_pushinteger(L, rc);
+		return 1;
 	}
 
   /* check for error. */
@@ -1646,9 +1991,10 @@ static int Epoller__wait_callback__meth(lua_State *L) {
 
 /* method: new */
 static int epoll__new__func(lua_State *L) {
-  int size = luaL_optinteger(L,1,64);
+  int size;
   int this_flags = OBJ_UDATA_FLAG_OWN;
   Epoller * this;
+  size = luaL_optinteger(L,1,64);
   this = epoller_create(size);
   obj_type_Epoller_push(L, this, this_flags);
   return 1;
@@ -2069,6 +2415,10 @@ static const obj_const obj_Errors_constants[] = {
   {NULL, NULL, 0.0 , 0}
 };
 
+static const reg_impl obj_Errors_implements[] = {
+  {NULL, NULL}
+};
+
 static const luaL_reg obj_Epoller_pub_funcs[] = {
   {"new", Epoller__new__meth},
   {NULL, NULL}
@@ -2101,6 +2451,10 @@ static const obj_field obj_Epoller_fields[] = {
 
 static const obj_const obj_Epoller_constants[] = {
   {NULL, NULL, 0.0 , 0}
+};
+
+static const reg_impl obj_Epoller_implements[] = {
+  {NULL, NULL}
 };
 
 static const luaL_reg epoll_function[] = {
@@ -2136,9 +2490,9 @@ static const obj_const epoll_constants[] = {
 
 
 static const reg_sub_module reg_sub_modules[] = {
-  { &(obj_type_Errors), REG_META, obj_Errors_pub_funcs, obj_Errors_methods, obj_Errors_metas, NULL, NULL, obj_Errors_constants, 1},
-  { &(obj_type_Epoller), REG_OBJECT, obj_Epoller_pub_funcs, obj_Epoller_methods, obj_Epoller_metas, obj_Epoller_bases, obj_Epoller_fields, obj_Epoller_constants, 0},
-  {NULL, 0, NULL, NULL, NULL, NULL, NULL, NULL, 0}
+  { &(obj_type_Errors), REG_META, obj_Errors_pub_funcs, obj_Errors_methods, obj_Errors_metas, NULL, NULL, obj_Errors_constants, NULL, 1},
+  { &(obj_type_Epoller), REG_OBJECT, obj_Epoller_pub_funcs, obj_Epoller_methods, obj_Epoller_metas, obj_Epoller_bases, obj_Epoller_fields, obj_Epoller_constants, obj_Epoller_implements, 0},
+  {NULL, 0, NULL, NULL, NULL, NULL, NULL, NULL, NULL, 0}
 };
 
 
@@ -2184,6 +2538,9 @@ LUA_NOBJ_API int luaopen_epoll(lua_State *L) {
 	const luaL_Reg *submodules = submodule_libs;
 	int priv_table = -1;
 
+	/* register interfaces */
+	obj_register_interfaces(L, obj_interfaces);
+
 	/* private table to hold reference to object metatables. */
 	lua_newtable(L);
 	priv_table = lua_gettop(L);
@@ -2225,7 +2582,7 @@ LUA_NOBJ_API int luaopen_epoll(lua_State *L) {
 
 #if LUAJIT_FFI
 	if(nobj_check_ffi_support(L)) {
-		nobj_try_loading_ffi(L, "epoll", epoll_ffi_lua_code,
+		nobj_try_loading_ffi(L, "epoll.nobj.ffi.lua", epoll_ffi_lua_code,
 			epoll_ffi_export, priv_table);
 	}
 #endif
