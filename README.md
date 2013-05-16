@@ -1,6 +1,8 @@
 lua-epoll
 =======
 
+[![travis-ci status](https://secure.travis-ci.org/Neopallium/lua-epoll.png?branch=master)](http://travis-ci.org/Neopallium/lua-epoll/builds)
+
 Lightweight epoll wrapper.
 
 See the `examples/nixio_server.lua` for an example of how to use.
