@@ -20,12 +20,10 @@
 #define luaL_Reg luaL_reg
 #endif
 
-/* some Lua 5.1 compatibility support. */
-#if !defined(LUA_VERSION_NUM) || (LUA_VERSION_NUM == 501)
 /*
-** Adapted from Lua 5.2.0
+** Adapted from Lua 5.2.0 luaL_setfuncs.
 */
-static void luaL_setfuncs (lua_State *L, const luaL_Reg *l, int nup) {
+static void nobj_setfuncs (lua_State *L, const luaL_Reg *l, int nup) {
   luaL_checkstack(L, nup, "too many upvalues");
   for (; l->name != NULL; l++) {  /* fill the table with given functions */
     int i;
@@ -38,6 +36,9 @@ static void luaL_setfuncs (lua_State *L, const luaL_Reg *l, int nup) {
   lua_pop(L, nup);  /* remove upvalues */
 }
 
+/* some Lua 5.1 compatibility support. */
+#if !defined(LUA_VERSION_NUM) || (LUA_VERSION_NUM == 501)
+
 #define lua_load_no_mode(L, reader, data, source) \
 	lua_load(L, reader, data, source)
 
@@ -45,7 +46,7 @@ static void luaL_setfuncs (lua_State *L, const luaL_Reg *l, int nup) {
 
 #endif
 
-#if LUA_VERSION_NUM == 502
+#if LUA_VERSION_NUM >= 502
 
 #define lua_load_no_mode(L, reader, data, source) \
 	lua_load(L, reader, data, source, NULL)
@@ -67,6 +68,7 @@ static int luaL_typerror (lua_State *L, int narg, const char *tname) {
 
 
 #include <sys/epoll.h>
+#include <unistd.h>
 #include <string.h>
 
 
@@ -1155,7 +1157,7 @@ static void obj_type_register_package(lua_State *L, const reg_sub_module *type_r
 	/* create public functions table. */
 	if(reg_list != NULL && reg_list[0].name != NULL) {
 		/* register functions */
-		luaL_setfuncs(L, reg_list, 0);
+		nobj_setfuncs(L, reg_list, 0);
 	}
 
 	obj_type_register_constants(L, type_reg->constants, -1, type_reg->bidirectional_consts);
@@ -1170,17 +1172,17 @@ static void obj_type_register_meta(lua_State *L, const reg_sub_module *type_reg)
 	reg_list = type_reg->pub_funcs;
 	if(reg_list != NULL && reg_list[0].name != NULL) {
 		/* register functions */
-		luaL_setfuncs(L, reg_list, 0);
+		nobj_setfuncs(L, reg_list, 0);
 	}
 
 	obj_type_register_constants(L, type_reg->constants, -1, type_reg->bidirectional_consts);
 
 	/* register methods. */
-	luaL_setfuncs(L, type_reg->methods, 0);
+	nobj_setfuncs(L, type_reg->methods, 0);
 
 	/* create metatable table. */
 	lua_newtable(L);
-	luaL_setfuncs(L, type_reg->metas, 0); /* fill metatable */
+	nobj_setfuncs(L, type_reg->metas, 0); /* fill metatable */
 	/* setmetatable on meta-object. */
 	lua_setmetatable(L, -2);
 
@@ -1205,7 +1207,7 @@ static void obj_type_register(lua_State *L, const reg_sub_module *type_reg, int 
 	reg_list = type_reg->pub_funcs;
 	if(reg_list != NULL && reg_list[0].name != NULL) {
 		/* register "constructors" as to object's public API */
-		luaL_setfuncs(L, reg_list, 0); /* fill public API table. */
+		nobj_setfuncs(L, reg_list, 0); /* fill public API table. */
 
 		/* make public API table callable as the default constructor. */
 		lua_newtable(L); /* create metatable */
@@ -1235,7 +1237,7 @@ static void obj_type_register(lua_State *L, const reg_sub_module *type_reg, int 
 #endif
 	}
 
-	luaL_setfuncs(L, type_reg->methods, 0); /* fill methods table. */
+	nobj_setfuncs(L, type_reg->methods, 0); /* fill methods table. */
 
 	luaL_newmetatable(L, type->name); /* create metatable */
 	lua_pushliteral(L, ".name");
@@ -1253,7 +1255,7 @@ static void obj_type_register(lua_State *L, const reg_sub_module *type_reg, int 
 	lua_pushvalue(L, -2); /* dup metatable. */
 	lua_rawset(L, priv_table);    /* priv_table["<object_name>"] = metatable */
 
-	luaL_setfuncs(L, type_reg->metas, 0); /* fill metatable */
+	nobj_setfuncs(L, type_reg->metas, 0); /* fill metatable */
 
 	/* add obj_bases to metatable. */
 	while(base->id >= 0) {
@@ -1383,19 +1385,7 @@ static const char *epoll_ffi_lua_code[] = { "local ffi=require\"ffi\"\n"
 "	return assert(ffi_safe_load(name, global))\n"
 "end\n"
 "\n"
-"local function ffi_string(ptr)\n"
-"	if ptr ~= nil then\n"
-"		return ffi.string(ptr)\n"
-"	end\n"
-"	return nil\n"
-"end\n"
-"\n"
-"local function ffi_string_len(ptr, len)\n"
-"	if ptr ~= nil then\n"
-"		return ffi.string(ptr, len)\n"
-"	end\n"
-"	return nil\n"
-"end\n"
+"local ffi_string = ffi.string\n"
 "\n"
 "local f_cast = ffi.cast\n"
 "local pcall = pcall\n"
@@ -1430,7 +1420,7 @@ static const char *epoll_ffi_lua_code[] = { "local ffi=require\"ffi\"\n"
 "		local dir_sep = p_config:sub(1,1)\n"
 "		local path_sep = p_config:sub(3,3)\n"
 "		local path_mark = p_config:sub(5,5)\n"
-"		local path_match = \"([^\" .. path_sep .. \"]*)\" .. path_sep\n"
+"		local path_match = \"([^\" .. path_sep .. \"]+)\"\n"
 "		-- convert dotted name to directory path.\n"
 "		name = name:gsub('%.', dir_sep)\n"
 "		-- try each path in search path.\n"
@@ -1526,6 +1516,13 @@ static const char *epoll_ffi_lua_code[] = { "local ffi=require\"ffi\"\n"
 "	end\n"
 "end\n"
 "\n"
+"ffi_safe_cdef(\"BufferIF\", [[\n"
+"typedef struct Buffer_if {\n"
+"  const uint8_t * (* const const_data)(void *this_v);\n"
+"  size_t (* const get_size)(void *this_v);\n"
+"} BufferIF;\n"
+"]])\n"
+"\n"
 "ffi_safe_cdef(\"MutableBufferIF\", [[\n"
 "typedef struct MutableBuffer_if {\n"
 "  uint8_t * (* const data)(void *this_v);\n"
@@ -1533,11 +1530,11 @@ static const char *epoll_ffi_lua_code[] = { "local ffi=require\"ffi\"\n"
 "} MutableBufferIF;\n"
 "]])\n"
 "\n"
-"ffi_safe_cdef(\"BufferIF\", [[\n"
-"typedef struct Buffer_if {\n"
-"  const uint8_t * (* const const_data)(void *this_v);\n"
-"  size_t (* const get_size)(void *this_v);\n"
-"} BufferIF;\n"
+"ffi_safe_cdef(\"FDIF\", [[\n"
+"typedef struct FD_if {\n"
+"  int (* const get_fd)(void *this_v);\n"
+"  int (* const get_type)(void *this_v);\n"
+"} FDIF;\n"
 "]])\n"
 "\n"
 "local Cmod = ffi_load_cmodule(\"epoll\", false)\n"
@@ -1765,11 +1762,14 @@ static const char *epoll_ffi_lua_code[] = { "local ffi=require\"ffi\"\n"
 "end\n"
 "\n"
 "\n"
+"local obj_type_Buffer_check =\n"
+"	obj_get_interface_check(\"BufferIF\", \"Expected object with Buffer interface\")\n"
+"\n"
 "local obj_type_MutableBuffer_check =\n"
 "	obj_get_interface_check(\"MutableBufferIF\", \"Expected object with MutableBuffer interface\")\n"
 "\n"
-"local obj_type_Buffer_check =\n"
-"	obj_get_interface_check(\"BufferIF\", \"Expected object with Buffer interface\")\n"
+"local obj_type_FD_check =\n"
+"	obj_get_interface_check(\"FDIF\", \"Expected object with FD interface\")\n"
 "\n"
 "\n"
 "-- Start \"Errors\" FFI interface\n"
@@ -1866,6 +1866,9 @@ static const char *epoll_ffi_lua_code[] = { "local ffi=require\"ffi\"\n"
 "			events[idx] = tonumber(self.events[n].events)\n"
 "			idx = idx + 1\n"
 "		end\n"
+"		return rc\n"
+"	elseif (rc == 0) then\n"
+"		return rc\n"
 "	end\n"
 "\n"
 "  -- check for error.\n"
@@ -1988,12 +1991,13 @@ int epoller_wait(Epoller *this, int timeout) {
 
 /* method: description */
 static int Errors__description__meth(lua_State *L) {
-  size_t msg_len = 1023;
+  size_t msg_len = 0;
   char msg_buf[1024];
   char * msg = msg_buf;
 	int err_type;
 	int err_num = -1;
 
+  msg_len = 1023;
 	err_type = lua_type(L, 2);
 	if(err_type == LUA_TSTRING) {
 		lua_pushvalue(L, 2);
@@ -2151,6 +2155,11 @@ static int Epoller__wait__meth(lua_State *L) {
 			lua_pushinteger(L, this->events[n].events);
 			lua_rawseti(L, 2, idx); idx++;
 		}
+		lua_pushinteger(L, rc);
+		return 1;
+	} else if(rc == 0) {
+		lua_pushinteger(L, rc);
+		return 1;
 	}
 
   /* check for error. */
@@ -2231,56 +2240,368 @@ static const obj_const obj_Errors_constants[] = {
 #ifdef ELNRNG
   {"ELNRNG", NULL, ELNRNG, CONST_NUMBER},
 #endif
-#ifdef EPFNOSUPPORT
-  {"EPFNOSUPPORT", NULL, EPFNOSUPPORT, CONST_NUMBER},
+#ifdef EISDIR
+  {"EISDIR", NULL, EISDIR, CONST_NUMBER},
 #endif
-#ifdef EBADR
-  {"EBADR", NULL, EBADR, CONST_NUMBER},
+#ifdef EFBIG
+  {"EFBIG", NULL, EFBIG, CONST_NUMBER},
 #endif
-#ifdef ENOLINK
-  {"ENOLINK", NULL, ENOLINK, CONST_NUMBER},
+#ifdef EDQUOT
+  {"EDQUOT", NULL, EDQUOT, CONST_NUMBER},
 #endif
-#ifdef ENOMSG
-  {"ENOMSG", NULL, ENOMSG, CONST_NUMBER},
+#ifdef EIO
+  {"EIO", NULL, EIO, CONST_NUMBER},
 #endif
-#ifdef ERESTART
-  {"ERESTART", NULL, ERESTART, CONST_NUMBER},
+#ifdef EBUSY
+  {"EBUSY", NULL, EBUSY, CONST_NUMBER},
 #endif
-#ifdef EUCLEAN
-  {"EUCLEAN", NULL, EUCLEAN, CONST_NUMBER},
+#ifdef ENOEXEC
+  {"ENOEXEC", NULL, ENOEXEC, CONST_NUMBER},
 #endif
-#ifdef ELIBSCN
-  {"ELIBSCN", NULL, ELIBSCN, CONST_NUMBER},
+#ifdef ENAVAIL
+  {"ENAVAIL", NULL, ENAVAIL, CONST_NUMBER},
 #endif
-#ifdef EROFS
-  {"EROFS", NULL, EROFS, CONST_NUMBER},
+#ifdef EEXIST
+  {"EEXIST", NULL, EEXIST, CONST_NUMBER},
 #endif
-#ifdef EBADE
-  {"EBADE", NULL, EBADE, CONST_NUMBER},
+#ifdef EPIPE
+  {"EPIPE", NULL, EPIPE, CONST_NUMBER},
 #endif
-#ifdef ENOTSOCK
-  {"ENOTSOCK", NULL, ENOTSOCK, CONST_NUMBER},
+#ifdef ELIBEXEC
+  {"ELIBEXEC", NULL, ELIBEXEC, CONST_NUMBER},
 #endif
-#ifdef ENOTCONN
-  {"ENOTCONN", NULL, ENOTCONN, CONST_NUMBER},
+#ifdef ENFILE
+  {"ENFILE", NULL, ENFILE, CONST_NUMBER},
+#endif
+#ifdef ENOMEDIUM
+  {"ENOMEDIUM", NULL, ENOMEDIUM, CONST_NUMBER},
 #endif
 #ifdef EREMOTE
   {"EREMOTE", NULL, EREMOTE, CONST_NUMBER},
 #endif
-#ifdef ECOMM
-  {"ECOMM", NULL, ECOMM, CONST_NUMBER},
+#ifdef ESPIPE
+  {"ESPIPE", NULL, ESPIPE, CONST_NUMBER},
 #endif
-#ifdef ENODATA
-  {"ENODATA", NULL, ENODATA, CONST_NUMBER},
+#ifdef EBADFD
+  {"EBADFD", NULL, EBADFD, CONST_NUMBER},
+#endif
+#ifdef ENOENT
+  {"ENOENT", NULL, ENOENT, CONST_NUMBER},
+#endif
+#ifdef EBADMSG
+  {"EBADMSG", NULL, EBADMSG, CONST_NUMBER},
+#endif
+#ifdef ENOTCONN
+  {"ENOTCONN", NULL, ENOTCONN, CONST_NUMBER},
+#endif
+#ifdef ENOPKG
+  {"ENOPKG", NULL, ENOPKG, CONST_NUMBER},
+#endif
+#ifdef EACCES
+  {"EACCES", NULL, EACCES, CONST_NUMBER},
+#endif
+#ifdef EL3HLT
+  {"EL3HLT", NULL, EL3HLT, CONST_NUMBER},
+#endif
+#ifdef EL2NSYNC
+  {"EL2NSYNC", NULL, EL2NSYNC, CONST_NUMBER},
+#endif
+#ifdef EDEADLOCK
+  {"EDEADLOCK", NULL, EDEADLOCK, CONST_NUMBER},
+#endif
+#ifdef ENOTEMPTY
+  {"ENOTEMPTY", NULL, ENOTEMPTY, CONST_NUMBER},
+#endif
+#ifdef ERESTART
+  {"ERESTART", NULL, ERESTART, CONST_NUMBER},
+#endif
+#ifdef EILSEQ
+  {"EILSEQ", NULL, EILSEQ, CONST_NUMBER},
+#endif
+#ifdef EKEYREJECTED
+  {"EKEYREJECTED", NULL, EKEYREJECTED, CONST_NUMBER},
+#endif
+#ifdef EDEADLK
+  {"EDEADLK", NULL, EDEADLK, CONST_NUMBER},
+#endif
+#ifdef EBADF
+  {"EBADF", NULL, EBADF, CONST_NUMBER},
+#endif
+#ifdef ECHILD
+  {"ECHILD", NULL, ECHILD, CONST_NUMBER},
+#endif
+#ifdef EALREADY
+  {"EALREADY", NULL, EALREADY, CONST_NUMBER},
+#endif
+#ifdef ENETDOWN
+  {"ENETDOWN", NULL, ENETDOWN, CONST_NUMBER},
+#endif
+#ifdef ENOLCK
+  {"ENOLCK", NULL, ENOLCK, CONST_NUMBER},
+#endif
+#ifdef ENOTSOCK
+  {"ENOTSOCK", NULL, ENOTSOCK, CONST_NUMBER},
+#endif
+#ifdef ELIBSCN
+  {"ELIBSCN", NULL, ELIBSCN, CONST_NUMBER},
+#endif
+#ifdef ENAMETOOLONG
+  {"ENAMETOOLONG", NULL, ENAMETOOLONG, CONST_NUMBER},
+#endif
+#ifdef EBFONT
+  {"EBFONT", NULL, EBFONT, CONST_NUMBER},
+#endif
+#ifdef ETXTBSY
+  {"ETXTBSY", NULL, ETXTBSY, CONST_NUMBER},
+#endif
+#ifdef EAFNOSUPPORT
+  {"EAFNOSUPPORT", NULL, EAFNOSUPPORT, CONST_NUMBER},
+#endif
+#ifdef EADV
+  {"EADV", NULL, EADV, CONST_NUMBER},
+#endif
+#ifdef EUSERS
+  {"EUSERS", NULL, EUSERS, CONST_NUMBER},
+#endif
+#ifdef ENOKEY
+  {"ENOKEY", NULL, ENOKEY, CONST_NUMBER},
+#endif
+#ifdef ETIME
+  {"ETIME", NULL, ETIME, CONST_NUMBER},
+#endif
+#ifdef EBADR
+  {"EBADR", NULL, EBADR, CONST_NUMBER},
+#endif
+#ifdef ERFKILL
+  {"ERFKILL", NULL, ERFKILL, CONST_NUMBER},
+#endif
+#ifdef ECONNABORTED
+  {"ECONNABORTED", NULL, ECONNABORTED, CONST_NUMBER},
+#endif
+#ifdef EREMOTEIO
+  {"EREMOTEIO", NULL, EREMOTEIO, CONST_NUMBER},
+#endif
+#ifdef EIDRM
+  {"EIDRM", NULL, EIDRM, CONST_NUMBER},
+#endif
+#ifdef ENOTTY
+  {"ENOTTY", NULL, ENOTTY, CONST_NUMBER},
+#endif
+#ifdef ECONNRESET
+  {"ECONNRESET", NULL, ECONNRESET, CONST_NUMBER},
+#endif
+#ifdef EADDRINUSE
+  {"EADDRINUSE", NULL, EADDRINUSE, CONST_NUMBER},
+#endif
+#ifdef EKEYREVOKED
+  {"EKEYREVOKED", NULL, EKEYREVOKED, CONST_NUMBER},
+#endif
+#ifdef ENOMEM
+  {"ENOMEM", NULL, ENOMEM, CONST_NUMBER},
+#endif
+#ifdef EOWNERDEAD
+  {"EOWNERDEAD", NULL, EOWNERDEAD, CONST_NUMBER},
+#endif
+#ifdef EROFS
+  {"EROFS", NULL, EROFS, CONST_NUMBER},
+#endif
+#ifdef EMEDIUMTYPE
+  {"EMEDIUMTYPE", NULL, EMEDIUMTYPE, CONST_NUMBER},
+#endif
+#ifdef ENOSPC
+  {"ENOSPC", NULL, ENOSPC, CONST_NUMBER},
+#endif
+#ifdef ESRMNT
+  {"ESRMNT", NULL, ESRMNT, CONST_NUMBER},
+#endif
+#ifdef ENOBUFS
+  {"ENOBUFS", NULL, ENOBUFS, CONST_NUMBER},
+#endif
+#ifdef EINTR
+  {"EINTR", NULL, EINTR, CONST_NUMBER},
+#endif
+#ifdef ENOMSG
+  {"ENOMSG", NULL, ENOMSG, CONST_NUMBER},
+#endif
+#ifdef ENOCSI
+  {"ENOCSI", NULL, ENOCSI, CONST_NUMBER},
 #endif
 #ifdef EPERM
   {"EPERM", NULL, EPERM, CONST_NUMBER},
 #endif
-#ifdef EBADRQC
-  {"EBADRQC", NULL, EBADRQC, CONST_NUMBER},
+#ifdef ENOSR
+  {"ENOSR", NULL, ENOSR, CONST_NUMBER},
 #endif
-#ifdef ENOSPC
-  {"ENOSPC", NULL, ENOSPC, CONST_NUMBER},
+#ifdef EREMCHG
+  {"EREMCHG", NULL, EREMCHG, CONST_NUMBER},
+#endif
+#ifdef EPFNOSUPPORT
+  {"EPFNOSUPPORT", NULL, EPFNOSUPPORT, CONST_NUMBER},
+#endif
+#ifdef EL3RST
+  {"EL3RST", NULL, EL3RST, CONST_NUMBER},
+#endif
+#ifdef EMULTIHOP
+  {"EMULTIHOP", NULL, EMULTIHOP, CONST_NUMBER},
+#endif
+#ifdef EAGAIN
+  {"EAGAIN", NULL, EAGAIN, CONST_NUMBER},
+#endif
+#ifdef ENODEV
+  {"ENODEV", NULL, ENODEV, CONST_NUMBER},
+#endif
+#ifdef ELIBBAD
+  {"ELIBBAD", NULL, ELIBBAD, CONST_NUMBER},
+#endif
+#ifdef ENOSTR
+  {"ENOSTR", NULL, ENOSTR, CONST_NUMBER},
+#endif
+#ifdef ELOOP
+  {"ELOOP", NULL, ELOOP, CONST_NUMBER},
+#endif
+#ifdef ECONNREFUSED
+  {"ECONNREFUSED", NULL, ECONNREFUSED, CONST_NUMBER},
+#endif
+#ifdef ENOPROTOOPT
+  {"ENOPROTOOPT", NULL, ENOPROTOOPT, CONST_NUMBER},
+#endif
+#ifdef ETIMEDOUT
+  {"ETIMEDOUT", NULL, ETIMEDOUT, CONST_NUMBER},
+#endif
+#ifdef EUCLEAN
+  {"EUCLEAN", NULL, EUCLEAN, CONST_NUMBER},
+#endif
+#ifdef ESOCKTNOSUPPORT
+  {"ESOCKTNOSUPPORT", NULL, ESOCKTNOSUPPORT, CONST_NUMBER},
+#endif
+#ifdef ETOOMANYREFS
+  {"ETOOMANYREFS", NULL, ETOOMANYREFS, CONST_NUMBER},
+#endif
+#ifdef EOVERFLOW
+  {"EOVERFLOW", NULL, EOVERFLOW, CONST_NUMBER},
+#endif
+#ifdef EINPROGRESS
+  {"EINPROGRESS", NULL, EINPROGRESS, CONST_NUMBER},
+#endif
+#ifdef ENOTDIR
+  {"ENOTDIR", NULL, ENOTDIR, CONST_NUMBER},
+#endif
+#ifdef EKEYEXPIRED
+  {"EKEYEXPIRED", NULL, EKEYEXPIRED, CONST_NUMBER},
+#endif
+#ifdef E2BIG
+  {"E2BIG", NULL, E2BIG, CONST_NUMBER},
+#endif
+#ifdef ECHRNG
+  {"ECHRNG", NULL, ECHRNG, CONST_NUMBER},
+#endif
+#ifdef EBADSLT
+  {"EBADSLT", NULL, EBADSLT, CONST_NUMBER},
+#endif
+#ifdef ECANCELED
+  {"ECANCELED", NULL, ECANCELED, CONST_NUMBER},
+#endif
+#ifdef ENOTRECOVERABLE
+  {"ENOTRECOVERABLE", NULL, ENOTRECOVERABLE, CONST_NUMBER},
+#endif
+#ifdef ERANGE
+  {"ERANGE", NULL, ERANGE, CONST_NUMBER},
+#endif
+#ifdef ENOSYS
+  {"ENOSYS", NULL, ENOSYS, CONST_NUMBER},
+#endif
+#ifdef EXFULL
+  {"EXFULL", NULL, EXFULL, CONST_NUMBER},
+#endif
+#ifdef EISNAM
+  {"EISNAM", NULL, EISNAM, CONST_NUMBER},
+#endif
+#ifdef ENOTUNIQ
+  {"ENOTUNIQ", NULL, ENOTUNIQ, CONST_NUMBER},
+#endif
+#ifdef ENXIO
+  {"ENXIO", NULL, ENXIO, CONST_NUMBER},
+#endif
+#ifdef ESTALE
+  {"ESTALE", NULL, ESTALE, CONST_NUMBER},
+#endif
+#ifdef EPROTOTYPE
+  {"EPROTOTYPE", NULL, EPROTOTYPE, CONST_NUMBER},
+#endif
+#ifdef ENOTNAM
+  {"ENOTNAM", NULL, ENOTNAM, CONST_NUMBER},
+#endif
+#ifdef ESTRPIPE
+  {"ESTRPIPE", NULL, ESTRPIPE, CONST_NUMBER},
+#endif
+#ifdef EMSGSIZE
+  {"EMSGSIZE", NULL, EMSGSIZE, CONST_NUMBER},
+#endif
+#ifdef ELIBACC
+  {"ELIBACC", NULL, ELIBACC, CONST_NUMBER},
+#endif
+#ifdef EHOSTUNREACH
+  {"EHOSTUNREACH", NULL, EHOSTUNREACH, CONST_NUMBER},
+#endif
+#ifdef EDOM
+  {"EDOM", NULL, EDOM, CONST_NUMBER},
+#endif
+#ifdef EMLINK
+  {"EMLINK", NULL, EMLINK, CONST_NUMBER},
+#endif
+#ifdef ESHUTDOWN
+  {"ESHUTDOWN", NULL, ESHUTDOWN, CONST_NUMBER},
+#endif
+#ifdef EHOSTDOWN
+  {"EHOSTDOWN", NULL, EHOSTDOWN, CONST_NUMBER},
+#endif
+#ifdef EPROTO
+  {"EPROTO", NULL, EPROTO, CONST_NUMBER},
+#endif
+#ifdef ENONET
+  {"ENONET", NULL, ENONET, CONST_NUMBER},
+#endif
+#ifdef EADDRNOTAVAIL
+  {"EADDRNOTAVAIL", NULL, EADDRNOTAVAIL, CONST_NUMBER},
+#endif
+#ifdef ENODATA
+  {"ENODATA", NULL, ENODATA, CONST_NUMBER},
+#endif
+#ifdef ECOMM
+  {"ECOMM", NULL, ECOMM, CONST_NUMBER},
+#endif
+#ifdef EPROTONOSUPPORT
+  {"EPROTONOSUPPORT", NULL, EPROTONOSUPPORT, CONST_NUMBER},
+#endif
+#ifdef EISCONN
+  {"EISCONN", NULL, EISCONN, CONST_NUMBER},
+#endif
+#ifdef EBADE
+  {"EBADE", NULL, EBADE, CONST_NUMBER},
+#endif
+#ifdef EINVAL
+  {"EINVAL", NULL, EINVAL, CONST_NUMBER},
+#endif
+#ifdef ENETRESET
+  {"ENETRESET", NULL, ENETRESET, CONST_NUMBER},
+#endif
+#ifdef ENETUNREACH
+  {"ENETUNREACH", NULL, ENETUNREACH, CONST_NUMBER},
+#endif
+#ifdef ENOLINK
+  {"ENOLINK", NULL, ENOLINK, CONST_NUMBER},
+#endif
+#ifdef EWOULDBLOCK
+  {"EWOULDBLOCK", NULL, EWOULDBLOCK, CONST_NUMBER},
+#endif
+#ifdef ENOANO
+  {"ENOANO", NULL, ENOANO, CONST_NUMBER},
+#endif
+#ifdef EFAULT
+  {"EFAULT", NULL, EFAULT, CONST_NUMBER},
+#endif
+#ifdef EDESTADDRREQ
+  {"EDESTADDRREQ", NULL, EDESTADDRREQ, CONST_NUMBER},
 #endif
 #ifdef ELIBMAX
   {"ELIBMAX", NULL, ELIBMAX, CONST_NUMBER},
@@ -2288,341 +2609,29 @@ static const obj_const obj_Errors_constants[] = {
 #ifdef EDOTDOT
   {"EDOTDOT", NULL, EDOTDOT, CONST_NUMBER},
 #endif
-#ifdef ENOPROTOOPT
-  {"ENOPROTOOPT", NULL, ENOPROTOOPT, CONST_NUMBER},
-#endif
-#ifdef EBFONT
-  {"EBFONT", NULL, EBFONT, CONST_NUMBER},
-#endif
-#ifdef EKEYREVOKED
-  {"EKEYREVOKED", NULL, EKEYREVOKED, CONST_NUMBER},
-#endif
-#ifdef ESRMNT
-  {"ESRMNT", NULL, ESRMNT, CONST_NUMBER},
-#endif
-#ifdef EOVERFLOW
-  {"EOVERFLOW", NULL, EOVERFLOW, CONST_NUMBER},
-#endif
-#ifdef EDQUOT
-  {"EDQUOT", NULL, EDQUOT, CONST_NUMBER},
-#endif
-#ifdef EFBIG
-  {"EFBIG", NULL, EFBIG, CONST_NUMBER},
-#endif
-#ifdef EIDRM
-  {"EIDRM", NULL, EIDRM, CONST_NUMBER},
-#endif
-#ifdef EDOM
-  {"EDOM", NULL, EDOM, CONST_NUMBER},
-#endif
-#ifdef EPROTO
-  {"EPROTO", NULL, EPROTO, CONST_NUMBER},
-#endif
-#ifdef EMULTIHOP
-  {"EMULTIHOP", NULL, EMULTIHOP, CONST_NUMBER},
-#endif
-#ifdef EBUSY
-  {"EBUSY", NULL, EBUSY, CONST_NUMBER},
-#endif
-#ifdef EDEADLOCK
-  {"EDEADLOCK", NULL, EDEADLOCK, CONST_NUMBER},
-#endif
-#ifdef ENOPKG
-  {"ENOPKG", NULL, ENOPKG, CONST_NUMBER},
-#endif
-#ifdef EPIPE
-  {"EPIPE", NULL, EPIPE, CONST_NUMBER},
-#endif
-#ifdef EADDRINUSE
-  {"EADDRINUSE", NULL, EADDRINUSE, CONST_NUMBER},
-#endif
-#ifdef EFAULT
-  {"EFAULT", NULL, EFAULT, CONST_NUMBER},
-#endif
-#ifdef EDEADLK
-  {"EDEADLK", NULL, EDEADLK, CONST_NUMBER},
-#endif
-#ifdef ENFILE
-  {"ENFILE", NULL, ENFILE, CONST_NUMBER},
-#endif
-#ifdef EAGAIN
-  {"EAGAIN", NULL, EAGAIN, CONST_NUMBER},
-#endif
-#ifdef ECONNABORTED
-  {"ECONNABORTED", NULL, ECONNABORTED, CONST_NUMBER},
-#endif
-#ifdef EMLINK
-  {"EMLINK", NULL, EMLINK, CONST_NUMBER},
-#endif
-#ifdef EBADMSG
-  {"EBADMSG", NULL, EBADMSG, CONST_NUMBER},
-#endif
-#ifdef ERFKILL
-  {"ERFKILL", NULL, ERFKILL, CONST_NUMBER},
-#endif
-#ifdef ENOTTY
-  {"ENOTTY", NULL, ENOTTY, CONST_NUMBER},
-#endif
-#ifdef ELIBACC
-  {"ELIBACC", NULL, ELIBACC, CONST_NUMBER},
-#endif
-#ifdef ETIME
-  {"ETIME", NULL, ETIME, CONST_NUMBER},
-#endif
-#ifdef ECHILD
-  {"ECHILD", NULL, ECHILD, CONST_NUMBER},
-#endif
-#ifdef ENOTRECOVERABLE
-  {"ENOTRECOVERABLE", NULL, ENOTRECOVERABLE, CONST_NUMBER},
-#endif
-#ifdef EISCONN
-  {"EISCONN", NULL, EISCONN, CONST_NUMBER},
-#endif
-#ifdef ENAVAIL
-  {"ENAVAIL", NULL, ENAVAIL, CONST_NUMBER},
-#endif
-#ifdef EDESTADDRREQ
-  {"EDESTADDRREQ", NULL, EDESTADDRREQ, CONST_NUMBER},
-#endif
-#ifdef EREMOTEIO
-  {"EREMOTEIO", NULL, EREMOTEIO, CONST_NUMBER},
-#endif
-#ifdef ESTALE
-  {"ESTALE", NULL, ESTALE, CONST_NUMBER},
-#endif
-#ifdef ESTRPIPE
-  {"ESTRPIPE", NULL, ESTRPIPE, CONST_NUMBER},
-#endif
-#ifdef EHOSTUNREACH
-  {"EHOSTUNREACH", NULL, EHOSTUNREACH, CONST_NUMBER},
-#endif
-#ifdef ENOTBLK
-  {"ENOTBLK", NULL, ENOTBLK, CONST_NUMBER},
-#endif
-#ifdef EEXIST
-  {"EEXIST", NULL, EEXIST, CONST_NUMBER},
-#endif
-#ifdef ENOTDIR
-  {"ENOTDIR", NULL, ENOTDIR, CONST_NUMBER},
-#endif
-#ifdef EWOULDBLOCK
-  {"EWOULDBLOCK", NULL, EWOULDBLOCK, CONST_NUMBER},
-#endif
-#ifdef EREMCHG
-  {"EREMCHG", NULL, EREMCHG, CONST_NUMBER},
-#endif
-#ifdef ELOOP
-  {"ELOOP", NULL, ELOOP, CONST_NUMBER},
-#endif
-#ifdef ENOTUNIQ
-  {"ENOTUNIQ", NULL, ENOTUNIQ, CONST_NUMBER},
-#endif
-#ifdef EMEDIUMTYPE
-  {"EMEDIUMTYPE", NULL, EMEDIUMTYPE, CONST_NUMBER},
-#endif
-#ifdef ENOLCK
-  {"ENOLCK", NULL, ENOLCK, CONST_NUMBER},
-#endif
-#ifdef EUNATCH
-  {"EUNATCH", NULL, EUNATCH, CONST_NUMBER},
-#endif
-#ifdef EPROTONOSUPPORT
-  {"EPROTONOSUPPORT", NULL, EPROTONOSUPPORT, CONST_NUMBER},
-#endif
-#ifdef EHOSTDOWN
-  {"EHOSTDOWN", NULL, EHOSTDOWN, CONST_NUMBER},
-#endif
-#ifdef ENXIO
-  {"ENXIO", NULL, ENXIO, CONST_NUMBER},
-#endif
-#ifdef ECONNRESET
-  {"ECONNRESET", NULL, ECONNRESET, CONST_NUMBER},
-#endif
-#ifdef EOWNERDEAD
-  {"EOWNERDEAD", NULL, EOWNERDEAD, CONST_NUMBER},
-#endif
-#ifdef EL2HLT
-  {"EL2HLT", NULL, EL2HLT, CONST_NUMBER},
-#endif
-#ifdef EBADSLT
-  {"EBADSLT", NULL, EBADSLT, CONST_NUMBER},
-#endif
-#ifdef ESHUTDOWN
-  {"ESHUTDOWN", NULL, ESHUTDOWN, CONST_NUMBER},
-#endif
-#ifdef EIO
-  {"EIO", NULL, EIO, CONST_NUMBER},
-#endif
-#ifdef ENOANO
-  {"ENOANO", NULL, ENOANO, CONST_NUMBER},
-#endif
-#ifdef EACCES
-  {"EACCES", NULL, EACCES, CONST_NUMBER},
-#endif
-#ifdef EOPNOTSUPP
-  {"EOPNOTSUPP", NULL, EOPNOTSUPP, CONST_NUMBER},
-#endif
-#ifdef EKEYREJECTED
-  {"EKEYREJECTED", NULL, EKEYREJECTED, CONST_NUMBER},
-#endif
-#ifdef EL3HLT
-  {"EL3HLT", NULL, EL3HLT, CONST_NUMBER},
-#endif
-#ifdef ELIBBAD
-  {"ELIBBAD", NULL, ELIBBAD, CONST_NUMBER},
-#endif
-#ifdef ENODEV
-  {"ENODEV", NULL, ENODEV, CONST_NUMBER},
-#endif
-#ifdef ENOSR
-  {"ENOSR", NULL, ENOSR, CONST_NUMBER},
-#endif
-#ifdef ENOBUFS
-  {"ENOBUFS", NULL, ENOBUFS, CONST_NUMBER},
-#endif
-#ifdef ENETUNREACH
-  {"ENETUNREACH", NULL, ENETUNREACH, CONST_NUMBER},
-#endif
-#ifdef ENOKEY
-  {"ENOKEY", NULL, ENOKEY, CONST_NUMBER},
-#endif
-#ifdef ECANCELED
-  {"ECANCELED", NULL, ECANCELED, CONST_NUMBER},
-#endif
-#ifdef ENETRESET
-  {"ENETRESET", NULL, ENETRESET, CONST_NUMBER},
-#endif
-#ifdef ENOENT
-  {"ENOENT", NULL, ENOENT, CONST_NUMBER},
-#endif
-#ifdef ENOSTR
-  {"ENOSTR", NULL, ENOSTR, CONST_NUMBER},
-#endif
-#ifdef EL3RST
-  {"EL3RST", NULL, EL3RST, CONST_NUMBER},
-#endif
-#ifdef EMFILE
-  {"EMFILE", NULL, EMFILE, CONST_NUMBER},
-#endif
-#ifdef ENOEXEC
-  {"ENOEXEC", NULL, ENOEXEC, CONST_NUMBER},
-#endif
-#ifdef ENOTEMPTY
-  {"ENOTEMPTY", NULL, ENOTEMPTY, CONST_NUMBER},
-#endif
-#ifdef EINVAL
-  {"EINVAL", NULL, EINVAL, CONST_NUMBER},
-#endif
-#ifdef ERANGE
-  {"ERANGE", NULL, ERANGE, CONST_NUMBER},
-#endif
-#ifdef ENONET
-  {"ENONET", NULL, ENONET, CONST_NUMBER},
-#endif
-#ifdef EISNAM
-  {"EISNAM", NULL, EISNAM, CONST_NUMBER},
-#endif
-#ifdef E2BIG
-  {"E2BIG", NULL, E2BIG, CONST_NUMBER},
-#endif
-#ifdef ENOTNAM
-  {"ENOTNAM", NULL, ENOTNAM, CONST_NUMBER},
-#endif
-#ifdef ETOOMANYREFS
-  {"ETOOMANYREFS", NULL, ETOOMANYREFS, CONST_NUMBER},
-#endif
-#ifdef EADDRNOTAVAIL
-  {"EADDRNOTAVAIL", NULL, EADDRNOTAVAIL, CONST_NUMBER},
-#endif
-#ifdef ENOSYS
-  {"ENOSYS", NULL, ENOSYS, CONST_NUMBER},
-#endif
-#ifdef EINPROGRESS
-  {"EINPROGRESS", NULL, EINPROGRESS, CONST_NUMBER},
-#endif
-#ifdef ETIMEDOUT
-  {"ETIMEDOUT", NULL, ETIMEDOUT, CONST_NUMBER},
-#endif
-#ifdef EBADFD
-  {"EBADFD", NULL, EBADFD, CONST_NUMBER},
-#endif
-#ifdef EISDIR
-  {"EISDIR", NULL, EISDIR, CONST_NUMBER},
-#endif
-#ifdef EADV
-  {"EADV", NULL, EADV, CONST_NUMBER},
-#endif
-#ifdef EINTR
-  {"EINTR", NULL, EINTR, CONST_NUMBER},
+#ifdef EBADRQC
+  {"EBADRQC", NULL, EBADRQC, CONST_NUMBER},
 #endif
 #ifdef ESRCH
   {"ESRCH", NULL, ESRCH, CONST_NUMBER},
 #endif
-#ifdef ESOCKTNOSUPPORT
-  {"ESOCKTNOSUPPORT", NULL, ESOCKTNOSUPPORT, CONST_NUMBER},
+#ifdef EOPNOTSUPP
+  {"EOPNOTSUPP", NULL, EOPNOTSUPP, CONST_NUMBER},
 #endif
-#ifdef EXFULL
-  {"EXFULL", NULL, EXFULL, CONST_NUMBER},
+#ifdef EMFILE
+  {"EMFILE", NULL, EMFILE, CONST_NUMBER},
 #endif
-#ifdef EPROTOTYPE
-  {"EPROTOTYPE", NULL, EPROTOTYPE, CONST_NUMBER},
+#ifdef EL2HLT
+  {"EL2HLT", NULL, EL2HLT, CONST_NUMBER},
 #endif
-#ifdef EUSERS
-  {"EUSERS", NULL, EUSERS, CONST_NUMBER},
+#ifdef ENOTBLK
+  {"ENOTBLK", NULL, ENOTBLK, CONST_NUMBER},
 #endif
-#ifdef ENETDOWN
-  {"ENETDOWN", NULL, ENETDOWN, CONST_NUMBER},
-#endif
-#ifdef EAFNOSUPPORT
-  {"EAFNOSUPPORT", NULL, EAFNOSUPPORT, CONST_NUMBER},
-#endif
-#ifdef ESPIPE
-  {"ESPIPE", NULL, ESPIPE, CONST_NUMBER},
-#endif
-#ifdef ETXTBSY
-  {"ETXTBSY", NULL, ETXTBSY, CONST_NUMBER},
-#endif
-#ifdef ECHRNG
-  {"ECHRNG", NULL, ECHRNG, CONST_NUMBER},
-#endif
-#ifdef ENOMEM
-  {"ENOMEM", NULL, ENOMEM, CONST_NUMBER},
-#endif
-#ifdef ECONNREFUSED
-  {"ECONNREFUSED", NULL, ECONNREFUSED, CONST_NUMBER},
-#endif
-#ifdef EMSGSIZE
-  {"EMSGSIZE", NULL, EMSGSIZE, CONST_NUMBER},
-#endif
-#ifdef EKEYEXPIRED
-  {"EKEYEXPIRED", NULL, EKEYEXPIRED, CONST_NUMBER},
-#endif
-#ifdef ENOMEDIUM
-  {"ENOMEDIUM", NULL, ENOMEDIUM, CONST_NUMBER},
-#endif
-#ifdef EILSEQ
-  {"EILSEQ", NULL, EILSEQ, CONST_NUMBER},
-#endif
-#ifdef ELIBEXEC
-  {"ELIBEXEC", NULL, ELIBEXEC, CONST_NUMBER},
-#endif
-#ifdef ENOCSI
-  {"ENOCSI", NULL, ENOCSI, CONST_NUMBER},
-#endif
-#ifdef EALREADY
-  {"EALREADY", NULL, EALREADY, CONST_NUMBER},
-#endif
-#ifdef ENAMETOOLONG
-  {"ENAMETOOLONG", NULL, ENAMETOOLONG, CONST_NUMBER},
-#endif
-#ifdef EBADF
-  {"EBADF", NULL, EBADF, CONST_NUMBER},
+#ifdef EUNATCH
+  {"EUNATCH", NULL, EUNATCH, CONST_NUMBER},
 #endif
 #ifdef EXDEV
   {"EXDEV", NULL, EXDEV, CONST_NUMBER},
-#endif
-#ifdef EL2NSYNC
-  {"EL2NSYNC", NULL, EL2NSYNC, CONST_NUMBER},
 #endif
   {NULL, NULL, 0.0 , 0}
 };
@@ -2675,17 +2684,14 @@ static const luaL_Reg epoll_function[] = {
 };
 
 static const obj_const epoll_constants[] = {
-#ifdef EPOLLPRI
-  {"EPOLLPRI", NULL, EPOLLPRI, CONST_NUMBER},
-#endif
-#ifdef EPOLLRDHUP
-  {"EPOLLRDHUP", NULL, EPOLLRDHUP, CONST_NUMBER},
-#endif
 #ifdef EPOLLERR
   {"EPOLLERR", NULL, EPOLLERR, CONST_NUMBER},
 #endif
 #ifdef EPOLLIN
   {"EPOLLIN", NULL, EPOLLIN, CONST_NUMBER},
+#endif
+#ifdef EPOLLONESHOT
+  {"EPOLLONESHOT", NULL, EPOLLONESHOT, CONST_NUMBER},
 #endif
 #ifdef EPOLLOUT
   {"EPOLLOUT", NULL, EPOLLOUT, CONST_NUMBER},
@@ -2693,8 +2699,11 @@ static const obj_const epoll_constants[] = {
 #ifdef EPOLLET
   {"EPOLLET", NULL, EPOLLET, CONST_NUMBER},
 #endif
-#ifdef EPOLLONESHOT
-  {"EPOLLONESHOT", NULL, EPOLLONESHOT, CONST_NUMBER},
+#ifdef EPOLLPRI
+  {"EPOLLPRI", NULL, EPOLLPRI, CONST_NUMBER},
+#endif
+#ifdef EPOLLRDHUP
+  {"EPOLLRDHUP", NULL, EPOLLRDHUP, CONST_NUMBER},
 #endif
   {NULL, NULL, 0.0 , 0}
 };
@@ -2768,7 +2777,7 @@ LUA_NOBJ_API int luaopen_epoll(lua_State *L) {
 	luaL_register(L, "epoll", epoll_function);
 #else
 	lua_newtable(L);
-	luaL_setfuncs(L, epoll_function, 0);
+	nobj_setfuncs(L, epoll_function, 0);
 #endif
 
 	/* register module constants. */
