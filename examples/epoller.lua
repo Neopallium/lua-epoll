@@ -59,13 +59,29 @@ function poll_mt:step(timeout)
 	assert(self.epoll:wait_callback(self.event_cb, timeout or -1))
 end
 
+local events = {}
 function poll_mt:start()
 	local epoll = self.epoll
 	local socks = self.socks
 	local event_cb = self.event_cb
 	self.is_running = true
 	while self.is_running do
-		epoll:wait_callback(event_cb, -1)
+		--epoll:wait_callback(event_cb, -1)
+		---[[
+		local num = epoll:wait(events, -1)
+		for i=1,num,2 do
+			local fd, ev = events[i], events[i+1]
+			-- call registered callback.
+			local sock = socks[fd]
+			if not sock then return end
+			local event_cb = sock.on_io_event
+			if event_cb then
+				event_cb(sock, ev)
+			else
+				self:del(sock)
+			end
+		end
+		--]]
 	end
 end
 

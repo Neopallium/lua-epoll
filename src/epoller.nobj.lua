@@ -150,6 +150,11 @@ int epoller_wait(Epoller *this, int timeout) {
 			lua_pushinteger(L, ${this}->events[n].events);
 			lua_rawseti(L, ${events::idx}, idx); idx++;
 		}
+		lua_pushinteger(L, rc);
+		return 1;
+	} else if(${rc} == 0) {
+		lua_pushinteger(L, rc);
+		return 1;
 	}
 ]],
  		ffi_source[[
@@ -162,6 +167,9 @@ int epoller_wait(Epoller *this, int timeout) {
 			${events}[idx] = tonumber(${this}.events[n].events)
 			idx = idx + 1
 		end
+		return ${rc}
+	elseif (${rc} == 0) then
+		return ${rc}
 	end
 ]],
  },

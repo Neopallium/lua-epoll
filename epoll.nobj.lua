@@ -9,6 +9,7 @@ luajit_ffi = true,
 luajit_ffi_load_cmodule = true,
 
 sys_include "sys/epoll.h",
+sys_include "unistd.h",
 
 export_definitions {
 "EPOLLIN",
