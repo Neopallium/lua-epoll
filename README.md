@@ -10,6 +10,11 @@ See the `examples/nixio_server.lua` for an example of how to use.
 Installing
 ----------
 
+### Install lua-epoll version 1.0:
+
+	luarocks install Neopallium/lua-epoll 1.0-1
+
+
 ### Install lua-epoll:
 
 	luarocks install https://github.com/Neopallium/lua-epoll/raw/master/lua-epoll-scm-0.rockspec
